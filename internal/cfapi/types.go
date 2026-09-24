@@ -17,6 +17,10 @@ const (
 	PlaceholderCreateFlagNone       uint32 = 0x00000000
 	PlaceholderCreateFlagMarkInSync uint32 = 0x00000002
 
+	// CF_CONVERT_FLAGS
+	ConvertFlagNone      uint32 = 0x00000000
+	ConvertFlagMarkInSync uint32 = 0x00000001
+
 	// CF_REGISTER_FLAGS
 	RegisterFlagNone   uint32 = 0x00000000
 	RegisterFlagUpdate uint32 = 0x00000001

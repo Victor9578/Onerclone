@@ -1,6 +1,15 @@
 # Onerclone —— 需求与进度记录
 
-> 更新时间：2026-09-24 · 状态：**Phase 0（Spike）进行中，因故暂停，恢复工作见 §7**
+> 更新时间：2026-09-25 · 状态：**Phase 0（Spike）✅ 图标验收通过，仅剩离线弹窗实测**
+
+---
+
+## 0. 环境变更（2026-09-25，新机器/新路径）
+
+- Go：`D:\Software\go\bin\go.exe`（v1.27.1，已加入用户 PATH；官方 zip 解压安装）
+- rclone：`D:\Software\rclone\rclone.exe`（**v1.70.0-quark**，含 quark backend + rc ✓）
+- 仓库：`D:\0Code\Onerclone`
+- spike 默认 `-rclone` flag 已改为新路径
 
 ---
 
@@ -168,22 +177,22 @@ Onerclone/
 │       ├── rc.go             RC 客户端（List/RangeGet/CopyFile/Version）
 │       └── daemon.go         rclone rcd 子进程管理（启动/就绪探测/Exited 监控）
 └── cmd/spike/                Spike 验证程序（register / run / unregister 子命令）
-    └── main.go               占位符初始化 + FETCH_DATA 水合 + watcher 防抖上传
+    ├── main.go               占位符初始化 + FETCH_DATA 水合 + watcher 防抖上传
+    └── shellreg.go           Shell 集成（SyncRootManager 注册表项，图标依赖，见坑6）
 ```
 
-### 环境（本机）
+### 环境（本机 · 2026-09-25 更新）
 
-- Go：`D:\0Project\Go\bin\go.exe`（已加入用户 PATH）
-- rclone：`D:\Tools\rclone\rclone.exe`（v1.70.0-quark）
+- Go：`D:\Software\go\bin\go.exe`（v1.27.1，已入用户 PATH）
+- rclone：`D:\Software\rclone\rclone.exe`（v1.70.0-quark）
 - 同步根：`C:\Users\Jw\OnercloneSpike`（已注册）
-- 云端替身（spike 测试用 local 后端）：`D:\0Project\0repos\Onerclone\spike-remote`
+- 云端替身（spike 测试用 local 后端）：仓库内 `spike-remote`
 - 日志：`spike.log`（控制台 + 文件双写）
 
 ### 运行手册
 
 ```powershell
-cd D:\0Project\0repos\Onerclone
-$env:Path += ';D:\0Project\Go\bin'
+cd D:\0Code\Onerclone
 
 .\spike.exe register            # 注册同步根（普通用户即可）
 .\spike.exe run                 # 启动（在线模式）
@@ -200,42 +209,31 @@ $env:Path += ';D:\0Project\Go\bin'
 | 3 | **水合全链路** | ✅ FETCH_DATA → rc-serve Range(206) → TRANSFER_DATA 回填；hello 2ms / 8MB 21ms / 嵌套 1ms，字节级正确 |
 | 4 | 离线快速失败 | ✅ 9~12ms 报“网络不可用”，不卡死（开放事实②） |
 | 5 | Population=ALWAYS_FULL | ✅ 枚举 60s 超时 → **0ms**；新建文件/目录 INVALID_NAME → **OK**；回调风暴消失 |
-| 6 | 水合零回声 | ✅ 水合写入不产生 watcher 事件（DR1 事实） |
+| 6 | 水合零回声 | ✅ 水合写入不产生 watcher 事件（DR1 事实）；**但据此在 FETCH_DATA 里 markSelfWrite 是错的（见坑3）** |
 | 7 | 事件监听 + 防抖 | ✅ raw 事件 → 入队（脏计数）→ 3s 后 AfterFunc 结算 → 触发上传 |
 | 8 | 心跳/日志探针 | ✅ 30s 心跳正常，watcher 存活可证 |
+| 9 | **上传链路（占位符修改）** | ✅ 2026-09-25：hello.txt WRITE → 3s 结算 → copyfile → 云端替身含 ROUND4–7 → SetInSync 成功（8ms） |
+| 10 | **本地新建文件上传** | ✅ brand-new/fresh-upload：普通文件 → copyfile → **CfConvertToPlaceholder(MARK_IN_SYNC)** 一步转换+标记 |
+| 11 | **rcd 保活** | ✅ 多轮长跑（>10min）rclone rcd 未再死掉；“20 秒死”是语法错误期的误判 |
+| 12 | **⭐ 云朵/绿勾图标（FR1 肉眼验收）** | ✅ 2026-09-25 截屏验证：hello/brand-new/fresh → **绿勾**（已水合+in-sync）、big.bin → **云朵**（未水合）、sub → 同步箭头（普通目录，未转占位符）。根因见坑6 |
 
-### ⚠️ 当前卡点（恢复工作从这里开始）
+### 🕳 已踩过的坑（2026-09-25 修复，写 Phase 1 代码前必读）
 
-1. **`cmd/spike/main.go:538` 语法错误未修**（上次编辑插入错位，orphan 语句在函数外）：
-   - 症状：`syntax error: non-declaration statement outside function body`
-   - 修法：把函数外的孤立行 `	log.Printf("▶ onSettled 入口 %s", base)` 移进 `func onSettled` 内（`base := filepath.Base(path)` 之后），函数外只留注释和函数头
-2. **rclone rcd 子进程约 20 秒后死掉**（上传时报 `connection refused`）：
-   - 已加 `Exited chan` + 后台 `cmd.Wait()` 收割 + main 里监控 goroutine（死时打印 rcd 输出）→ **修完语法错误跑一次即知根因**
-3. **结算批次只处理第 1 项就没下文**（brand-new 尝试上传后，hello.txt 的 ⬆ 日志缺失）：
-   - 已加 `▶ 结算开始/已处理/完成` 和 `▶ onSettled 入口` 探针 → 同上，跑一次即知卡在哪
+1. **orphan 语句语法错误**：上次编辑把 `log.Printf` 插到了 `onSettled` 函数外 → 已修。
+2. **`CfSetInSyncState` 报 `0x80070178`（Win32 376 = “此文件不是云文件”）**：用户**新建的普通文件**上传后直接 SetInSync 必失败。正确姿势：`CfConvertToPlaceholder(handle, nil, 0, CF_CONVERT_FLAG_MARK_IN_SYNC, NULL, NULL)` 一步转换+in-sync。已封装 `cfapi.ConvertToPlaceholder`（句柄需 GENERIC_READ|GENERIC_WRITE，属性级访问不够）。
+3. **回声抑制误杀真实写入**：`handleFetchData` 里 `markSelfWrite`（15s 窗口）会吞掉**水合之后的真实用户写入**（Add-Content 先触发水合再落盘 → WRITE 被当回声）。既然实测水合零事件，该标记已删除。
+4. **⭐ Go 1.23+ `os.FileMode` 坑（最重要的坑）**：CFAPI 占位符的 reparse tag 是 `IO_REPARSE_TAG_CLOUD_*`（未知 tag）→ Go 判为 **`ModeIrregular` → `IsRegular()==false`**！任何 `st.Mode().IsRegular()` 过滤都会**静默跳过所有占位符**。正确判法：irregular 时再查 `syscall.GetFileAttributes`，带 `FILE_ATTRIBUTE_REPARSE_POINT` 且非目录 = 云占位符，**照常参与同步**（同机 `go run` 的临时进程可能取不到 ReparseTag 显示 regular，别被误导，见 os/types_windows.go:227）。
+5. PowerShell `Get-Content spike.log` 默认按 ANSI(GBK) 解码 UTF-8 会满屏乱码；用编辑器/grep 工具看原文。
+6. **⭐⭐ 图标不显示的根因（2026-09-25 破案，FR1 验收关键）**：`CfRegisterSyncRoot` 只做内核级注册（`CfGetSyncRootInfoByPath` 可查到），**不写 `HKLM\...\Explorer\SyncRootManager` 注册表项**；而 Explorer 的状态图标（绿勾/云朵/同步箭头）**完全依赖这层 Shell 注册**（官方文档 "Integrate a Cloud Storage Provider"：该键由 provider 自己创建，键名 `[ProviderName]![SID]![AccountID]`，需写 `DisplayNameResource`/`IconResource`/`Flags=0x162`/`UserSyncRoots\[SID]=路径`）。文件占位符状态全对（PLACEHOLDER+IN_SYNC 探测为绿）也绝不显示图标。已封装进 `cmd/spike/shellreg.go`（`register` 自动写、`unregister` 自动删，普通用户可写该键）。**写完/改完需重启 Explorer 才生效**。证据：`final_zoom.png`、`verify_final.png`。
+7. **无签名进程读不到占位符属性位**：Go/无签名 C# 进程 `GetFileAttributesW` 对占位符返回 `0x20`（丢 REPARSE/SPARSE/OFFLINE 位），微软签名宿主（PowerShell）读到 `0x420`——诊断占位符状态**必须用签名宿主**（如 PS + P/Invoke），否则探针全是假阴性（`NO_STATES`）。（spike 进程因已 Connect sync root 可见真实属性。）
 
-### Phase 0 剩余验收
+### ⚠️ 待肉眼验收（Phase 0 收尾）
 
-- [ ] 修语法错误 → 重跑，拿到 2/3 的根因
-- [ ] 上传链路走通：本地修改 → copyfile → 云端替身内容一致 + in-sync 标记
-- [ ] 离线模式下用记事本/资源管理器实测弹窗表现（开放事实②收尾）
-- [ ] 资源管理器肉眼确认云朵图标（FR1 图标条件：in-sync + 未水合）
+- [x] 资源管理器确认云朵图标（FR1）→ **✅ 2026-09-25 通过**，见坑6 + `final_zoom.png`/`verify_final.png`；`sub` 目录是普通目录未转占位符（显示同步箭头），Phase 1 需把目录也转占位符
+- [ ] 离线模式（`run -offline`）下用记事本/资源管理器实测弹窗表现（开放事实②收尾，Office 待测）
 - [ ] （可选顺带）目录列举按 mtime 增量的可行性（Q15c）
 
 ---
-
-## 7. 恢复工作清单（回家接着干）
-
-1. 修 `main.go:538` 语法错误（§6 卡点1）
-2. `go build && go vet` → `.\spike.exe run` → 跑测试序列：
-   ```powershell
-   [IO.File]::WriteAllText('C:\Users\Jw\OnercloneSpike\brand-new.txt','hello')
-   Add-Content 'C:\Users\Jw\OnercloneSpike\hello.txt' 'ROUND4'
-   Start-Sleep 6
-   Get-Content .\spike.log   # 看 rcd 死因 + 结算探针 + 上传结果
-   ```
-3. 依根因修复：rdc 保活（必要时加自动重启）→ 结算批次 bug
-4. 上传验证通过后 = **Phase 0 全部完成** → 进入 Phase 1（见下）
 
 ## 8. 后续 Phase 划分
 

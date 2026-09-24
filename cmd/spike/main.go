@@ -38,6 +38,7 @@ import (
 const (
 	hrAlreadyExists = 0x800700B7 // ERROR_ALREADY_EXISTS → HRESULT
 	hrAccessDenied  = 0x80070005 // ERROR_ACCESS_DENIED → HRESULT
+	hrNotCloudFile  = 0x80070178 // ERROR_NOT_CLOUD_FILE → 文件还不是占位符
 
 	// 本程序写入本地后的回声抑制窗口：期间该路径的 watcher 事件视为自写
 	selfWriteWindow = 15 * time.Second
@@ -173,6 +174,13 @@ func cmdRegister(args []string) {
 		os.Exit(1)
 	}
 	log.Printf("✅ 注册成功，elevated=%v", elev)
+	// Shell 集成：SyncRootManager 注册表项（Explorer 状态图标依赖此层，
+	// CfRegisterSyncRoot 不写它）——不写 = 云朵/绿勾图标永远不显示
+	if err := shellRegister(*root); err != nil {
+		log.Printf("⚠ Shell 注册失败（图标将不显示）: %v", err)
+	} else {
+		log.Print("✅ Shell 注册成功（SyncRootManager ✓ 图标将显示）")
+	}
 	if !elev {
 		log.Print("→ 开放事实①结论：普通用户即可注册，安装流程无需 UAC！")
 	} else {
@@ -188,7 +196,10 @@ func cmdUnregister(args []string) {
 	if err := cfapi.UnregisterSyncRoot(*root); err != nil {
 		log.Fatalf("注销失败（若程序在跑请先退出）: %v", err)
 	}
-	log.Print("✅ 已注销同步根")
+	if err := shellUnregister(); err != nil {
+		log.Printf("⚠ Shell 注销失败（残留 SyncRootManager 键）: %v", err)
+	}
+	log.Print("✅ 已注销同步根（内核 + Shell）")
 }
 
 // ---------- run ----------
@@ -197,7 +208,7 @@ func cmdRun(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	root := fs.String("root", defaultRoot(), "同步根目录")
 	fsDir := fs.String("fs", defaultFs(), "云端替身目录（rclone local 后端）")
-	rcloneExe := fs.String("rclone", `D:\Tools\rclone\rclone.exe`, "rclone 可执行文件")
+	rcloneExe := fs.String("rclone", `D:\Software\rclone\rclone.exe`, "rclone 可执行文件")
 	offline := fs.Bool("offline", false, "离线模式：水合请求立即快速失败")
 	_ = fs.Parse(args)
 
@@ -409,8 +420,9 @@ func (a *app) handleFetchData(info *cfapi.CallbackInfo, params *cfapi.CallbackPa
 		return
 	}
 
-	// 回声防护：先标记“这是我写的”，watcher 事件到达时直接丢弃
-	a.markSelfWrite(path)
+	// DR1 实测：水合回填不产生 watcher 事件，无需 markSelfWrite——
+	// 之前在这里标记 15s 自写窗口，反而把紧随其后的真实用户写入吞掉
+	//（Add-Content 先触发水合再落盘 → WRITE 事件被误抑制 → 上传丢失）。
 
 	t0 := time.Now()
 	data, err := a.rc.RangeGet(a.fsRoot, rel, off, end)
@@ -535,10 +547,10 @@ func (a *app) addTree(w *fsnotify.Watcher, root string) error {
 	})
 }
 
-	log.Printf("▶ onSettled 入口 %s", base)
 // onSettled —— 防抖窗口结束后的结算处理。
 func (a *app) onSettled(path string) {
 	base := filepath.Base(path)
+	log.Printf("▶ onSettled 入口 %s", base)
 
 	// 回声过滤：程序自己（水合/占位符）写的，直接丢弃（DR1）
 	if a.isSelfWrite(path) {
@@ -552,12 +564,34 @@ func (a *app) onSettled(path string) {
 		log.Printf("✖ 本地删除/移出（spike 不同步删除，Phase 1 处理）: %s", base)
 		return
 	}
-	if !st.IsDir() && st.Mode().IsRegular() && st.Size() == 0 {
+	if !st.IsDir() && st.Size() == 0 {
 		log.Printf("· 跳过 0 字节（未水合占位符或空文件）: %s", base)
 		return
 	}
-	if st.IsDir() || !st.Mode().IsRegular() {
+	if st.IsDir() {
+		log.Printf("· 跳过目录: %s", base)
 		return
+	}
+	if !st.Mode().IsRegular() {
+		// Go 1.23+ 把未知 reparse tag（含 CFAPI 云占位符 IO_REPARSE_TAG_CLOUD_*）
+		// 标为 ModeIrregular → IsRegular()==false。占位符本质是磁盘文件，
+		// 必须照常参与同步；只跳过真正的特殊文件（符号链接/管道/设备）。
+		if st.Mode()&os.ModeIrregular == 0 {
+			log.Printf("· 跳过特殊文件 %s: mode=%s", base, st.Mode())
+			return
+		}
+		p, perr := syscall.UTF16PtrFromString(path)
+		if perr != nil {
+			log.Printf("· 跳过无法解码路径: %s (%v)", base, perr)
+			return
+		}
+		attr, aerr := syscall.GetFileAttributes(p)
+		if aerr != nil || attr&syscall.FILE_ATTRIBUTE_REPARSE_POINT == 0 ||
+			attr&syscall.FILE_ATTRIBUTE_DIRECTORY != 0 {
+			log.Printf("· 跳过非常规条目 %s: mode=%s (attr=0x%X err=%v)", base, st.Mode(), attr, aerr)
+			return
+		}
+		// 云占位符：继续走上传流程
 	}
 
 	rel, err := a.rel(path)
@@ -571,6 +605,15 @@ func (a *app) onSettled(path string) {
 		return
 	}
 	if err := cfapi.SetInSync(path); err != nil {
+		if code, ok := cfapi.AsHRESULT(err); ok && code == hrNotCloudFile {
+			// 用户新建的普通文件：上传成功后转换为占位符并一并标记 in-sync
+			if cerr := cfapi.ConvertToPlaceholder(path, cfapi.ConvertFlagMarkInSync); cerr != nil {
+				log.Printf("⚠ 上传成功但转占位符失败 %s: %v", base, cerr)
+				return
+			}
+			log.Printf("✅ 已同步 %s（普通文件 → 占位符 + in-sync ✓）", base)
+			return
+		}
 		log.Printf("⚠ 上传成功但 in-sync 标记失败 %s: %v", base, err)
 		return
 	}

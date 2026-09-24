@@ -22,6 +22,7 @@ var (
 	procExecute            = dll.NewProc("CfExecute")
 	procCreatePlaceholders = dll.NewProc("CfCreatePlaceholders")
 	procSetInSyncState     = dll.NewProc("CfSetInSyncState")
+	procConvertToPlaceholder = dll.NewProc("CfConvertToPlaceholder")
 )
 
 // HresultError 表示一次 cfapi 调用返回的失败 HRESULT。
@@ -383,6 +384,32 @@ func SetInSync(path string) error {
 		uintptr(InSyncStateInSync),
 		uintptr(SetInSyncFlagNone),
 		0, // InSyncUsn = NULL：不校验 USN
+	)
+	runtime.KeepAlive(p)
+	return hr(r1)
+}
+
+// ConvertToPlaceholder 把用户在同步根里新建的普通文件转换为占位符。
+// handleFetchData 之外的场景：本地新建文件上传成功后调用，一步完成
+// 转换 + in-sync 标记（CF_CONVERT_FLAG_MARK_IN_SYNC）。
+// FileIdentity 可选，故传 nil/0（后续 CfUpdatePlaceholder 可再补）。
+func ConvertToPlaceholder(path string, flags uint32) error {
+	p := utf16ptr(path)
+	// 转换需要通用写权限（与 CreateFile 的属性级访问不同）
+	h, err := syscall.CreateFile(p,
+		syscall.GENERIC_READ|syscall.GENERIC_WRITE,
+		fileShareAll, nil, openExisting, 0, 0)
+	if err != nil {
+		return fmt.Errorf("cfapi: open for convert: %w", err)
+	}
+	defer syscall.CloseHandle(h)
+	r1, _, _ := procConvertToPlaceholder.Call(
+		uintptr(h),
+		0, // FileIdentity = NULL
+		0, // FileIdentityLength = 0
+		uintptr(flags),
+		0, // ConvertUsn = NULL
+		0, // Overlapped = NULL
 	)
 	runtime.KeepAlive(p)
 	return hr(r1)
