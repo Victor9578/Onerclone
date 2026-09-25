@@ -30,7 +30,9 @@ import (
 	"unsafe"
 
 	"onerclone/internal/cfapi"
+	"onerclone/internal/engine"
 	"onerclone/internal/rclone"
+	"onerclone/internal/state"
 
 	"github.com/fsnotify/fsnotify"
 )
@@ -60,8 +62,16 @@ type app struct {
 	session  *cfapi.Session
 	offline  bool
 
-	selfMu    sync.Mutex
-	selfWrite map[string]time.Time
+	// P1 引擎（双向同步：快照 diff + 动作队列）
+	eng   *engine.Engine
+	store *state.Store
+
+	// watcher 防抖后踢 pollLoop 立即轮询（本地有活动 = 活跃期语义）
+	pollKick chan struct{}
+
+	// watcher 触发全量扫描的节流（引擎自身有 mu，这里防扫描风暴）
+	scanMu      sync.Mutex
+	scanPending *time.Timer
 
 	// FETCH_PLACEHOLDERS 限流日志计数
 	fetchPhMu    sync.Mutex
@@ -216,7 +226,7 @@ func cmdRun(args []string) {
 		syncRoot:  *root,
 		fsRoot:    filepath.ToSlash(*fsDir),
 		offline:   *offline,
-		selfWrite: map[string]time.Time{},
+		pollKick:  make(chan struct{}, 1),
 	}
 
 	// 1) 验证平台可用
@@ -267,13 +277,50 @@ func cmdRun(args []string) {
 	defer a.session.Disconnect()
 	log.Print("同步根已连接（FETCH_DATA 回调在线）")
 
-	// 5) 全量列举云端 → 创建占位符
+	// 5) 打开 P1 状态库 + 建引擎（三库模型：local_snap/cloud_snap/queue）
+	statePath := filepath.Join(filepath.Dir(a.syncRoot), "OnercloneSpike.state", "state.db")
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
+		log.Fatalf("创建状态目录失败: %v", err)
+	}
+	a.store, err = state.Open(statePath)
+	if err != nil {
+		log.Fatalf("打开状态库失败: %v", err)
+	}
+	defer a.store.Close()
+	log.Printf("状态库: %s", statePath)
+
+	a.eng = engine.New(a.store,
+		&cloudRC{rc: a.rc, srcFs: a.syncRoot, dstFs: a.fsRoot},
+		&localFS{root: a.syncRoot}, log.Default())
+
+	// 6) 首轮基线：本地扫描 + 云端轮询 → 建立三库快照（DR2 之前无删除）
+	if n, err := a.eng.Scan(); err != nil {
+		log.Printf("⚠ 首轮本地扫描失败: %v", err)
+	} else {
+		log.Printf("首轮本地扫描：入队 %d", n)
+	}
+	if n, err := a.eng.Poll(); err != nil {
+		log.Fatalf("首轮云端轮询失败（基线无法建立）: %v", err)
+	} else {
+		log.Printf("首轮云端轮询：入队 %d", n)
+	}
+
+	// 7) 引擎执行器（动作队列 worker，崩溃残留自动回收）
+	workerStop := make(chan struct{})
+	defer close(workerStop)
+	go a.eng.RunWorker(workerStop, 8)
+
+	// 8) 分层轮询（Q15）：活跃 60s / 空闲 5min；每 12h 强制一次
+	go a.pollLoop()
+
+	// 9) 全量列举云端 → 创建占位符（首轮快速预热；之后由引擎 download 接管）
 	start := time.Now()
 	n, err := a.populate("", a.syncRoot)
 	if err != nil {
-		log.Fatalf("初始化占位符失败: %v", err)
+		log.Printf("⚠ 占位符预热失败（不致命，引擎会补齐）: %v", err)
+	} else {
+		log.Printf("✅ 占位符就绪: %d 个文件，用时 %s", n, time.Since(start).Round(time.Millisecond))
 	}
-	log.Printf("✅ 占位符就绪: %d 个文件，用时 %s", n, time.Since(start).Round(time.Millisecond))
 
 	// 6) 监听本地改动（防抖 3s）
 	w, err := a.startWatcher()
@@ -468,18 +515,22 @@ func (a *app) startWatcher() (*fsnotify.Watcher, error) {
 				mu.Unlock()
 				return
 			}
-			batch := make([]string, 0, len(dirty))
-			for p := range dirty {
-				batch = append(batch, p)
-			}
+			n := len(dirty)
 			dirty = map[string]bool{}
 			mu.Unlock()
-			log.Printf("▶ 结算开始（%d 项）", len(batch))
-			for _, p := range batch {
-				a.onSettled(p)
-				log.Printf("▶ 已处理 %s", filepath.Base(p))
+			log.Printf("▶ 防抖结算（%d 项）→ 引擎全量扫描", n)
+			// P1：不再逐路径手工上传——全量 Scan 由引擎做快照 diff，
+			// 回声防护结构性内建（程序自写的落地已同步进快照）
+			if cnt, err := a.eng.Scan(); err != nil {
+				log.Printf("✗ 引擎扫描失败: %v", err)
+			} else if cnt > 0 {
+				log.Printf("✅ 扫描入队 %d 个动作", cnt)
 			}
-			log.Print("▶ 结算完成")
+			// 本地有活动 → 踢 pollLoop 立即对账（Q15 活跃期）
+			select {
+			case a.pollKick <- struct{}{}:
+			default:
+			}
 		}
 
 		schedule := func(path string) {
@@ -547,77 +598,48 @@ func (a *app) addTree(w *fsnotify.Watcher, root string) error {
 	})
 }
 
-// onSettled —— 防抖窗口结束后的结算处理。
-func (a *app) onSettled(path string) {
-	base := filepath.Base(path)
-	log.Printf("▶ onSettled 入口 %s", base)
-
-	// 回声过滤：程序自己（水合/占位符）写的，直接丢弃（DR1）
-	if a.isSelfWrite(path) {
-		log.Printf("↩ 回声抑制（程序自写）: %s", base)
-		a.clearSelfWrite(path)
-		return
-	}
-
-	st, err := os.Stat(path)
-	if err != nil {
-		log.Printf("✖ 本地删除/移出（spike 不同步删除，Phase 1 处理）: %s", base)
-		return
-	}
-	if !st.IsDir() && st.Size() == 0 {
-		log.Printf("· 跳过 0 字节（未水合占位符或空文件）: %s", base)
-		return
-	}
-	if st.IsDir() {
-		log.Printf("· 跳过目录: %s", base)
-		return
-	}
-	if !st.Mode().IsRegular() {
-		// Go 1.23+ 把未知 reparse tag（含 CFAPI 云占位符 IO_REPARSE_TAG_CLOUD_*）
-		// 标为 ModeIrregular → IsRegular()==false。占位符本质是磁盘文件，
-		// 必须照常参与同步；只跳过真正的特殊文件（符号链接/管道/设备）。
-		if st.Mode()&os.ModeIrregular == 0 {
-			log.Printf("· 跳过特殊文件 %s: mode=%s", base, st.Mode())
-			return
+// pollLoop —— Q15 分层轮询：活跃期 60s / 空闲期 5min / 每 12h 强制对账。
+// 队列有活 = 活跃（说明用户在操作）。
+func (a *app) pollLoop() {
+	const (
+		active    = 60 * time.Second
+		idle      = 5 * time.Minute
+		fullRecon = 12 * time.Hour
+	)
+	lastFull := time.Now()
+	for {
+		// 决定本轮节奏（Q15 分层：队列有活 = 活跃期；本地事件踢醒 = 立即对账）
+		wait := idle
+		if pending, err := a.store.PendingCount(); err == nil && pending > 0 {
+			wait = active
 		}
-		p, perr := syscall.UTF16PtrFromString(path)
-		if perr != nil {
-			log.Printf("· 跳过无法解码路径: %s (%v)", base, perr)
-			return
+		select {
+		case <-a.pollKick:
+			// 本地刚有活动：立即对账（对端可能同时有变更）
+		case <-time.After(wait):
 		}
-		attr, aerr := syscall.GetFileAttributes(p)
-		if aerr != nil || attr&syscall.FILE_ATTRIBUTE_REPARSE_POINT == 0 ||
-			attr&syscall.FILE_ATTRIBUTE_DIRECTORY != 0 {
-			log.Printf("· 跳过非常规条目 %s: mode=%s (attr=0x%X err=%v)", base, st.Mode(), attr, aerr)
-			return
-		}
-		// 云占位符：继续走上传流程
-	}
 
-	rel, err := a.rel(path)
-	if err != nil {
-		log.Printf("✗ 路径越界: %s", base)
-		return
-	}
-	log.Printf("⬆ 上传 %s (%d bytes)", base, st.Size())
-	if err := a.rc.CopyFile(a.syncRoot, rel, a.fsRoot, rel); err != nil {
-		log.Printf("✗ 上传失败 %s: %v", base, err)
-		return
-	}
-	if err := cfapi.SetInSync(path); err != nil {
-		if code, ok := cfapi.AsHRESULT(err); ok && code == hrNotCloudFile {
-			// 用户新建的普通文件：上传成功后转换为占位符并一并标记 in-sync
-			if cerr := cfapi.ConvertToPlaceholder(path, cfapi.ConvertFlagMarkInSync); cerr != nil {
-				log.Printf("⚠ 上传成功但转占位符失败 %s: %v", base, cerr)
-				return
+		// 12h 强制全量对账（Q15 兜底）：额外补一轮本地扫描
+		if time.Since(lastFull) >= fullRecon {
+			if n, err := a.eng.Scan(); err == nil && n > 0 {
+				log.Printf("🕒 12h 全量对账：本地扫描入队 %d", n)
 			}
-			log.Printf("✅ 已同步 %s（普通文件 → 占位符 + in-sync ✓）", base)
-			return
+			lastFull = time.Now()
 		}
-		log.Printf("⚠ 上传成功但 in-sync 标记失败 %s: %v", base, err)
-		return
+
+		n, err := a.eng.Poll()
+		if err != nil {
+			log.Printf("⚠ 云端轮询失败（队列按分类退避自动补传）: %v", err)
+			// 认证失败提醒（Q16/DR4）
+			if cnt, _ := a.store.CountAuthFailed(); cnt > 0 {
+				log.Printf("🛑 %d 个动作因认证失败停摆，需重新扫码", cnt)
+			}
+			continue
+		}
+		if n > 0 {
+			log.Printf("☁️ 云端轮询入队 %d 个动作", n)
+		}
 	}
-	log.Printf("✅ 已同步 %s（in-sync ✓ 图标应变绿勾）", base)
 }
 
 // ---------- 工具 ----------
@@ -628,33 +650,6 @@ func (a *app) rel(path string) (string, error) {
 		return "", err
 	}
 	return filepath.ToSlash(r), nil
-}
-
-func (a *app) markSelfWrite(path string) {
-	a.selfMu.Lock()
-	defer a.selfMu.Unlock()
-	a.selfWrite[strings.ToLower(path)] = time.Now().Add(selfWriteWindow)
-}
-
-func (a *app) isSelfWrite(path string) bool {
-	a.selfMu.Lock()
-	defer a.selfMu.Unlock()
-	key := strings.ToLower(path)
-	deadline, ok := a.selfWrite[key]
-	if !ok {
-		return false
-	}
-	if time.Now().After(deadline) {
-		delete(a.selfWrite, key)
-		return false
-	}
-	return true
-}
-
-func (a *app) clearSelfWrite(path string) {
-	a.selfMu.Lock()
-	defer a.selfMu.Unlock()
-	delete(a.selfWrite, strings.ToLower(path))
 }
 
 // ensureSample 在云端替身目录里准备验证数据。

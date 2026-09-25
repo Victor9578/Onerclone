@@ -1,6 +1,6 @@
 # Onerclone —— 需求与进度记录
 
-> 更新时间：2026-09-25 · 状态：**Phase 0（Spike）✅ 图标验收通过，仅剩离线弹窗实测**
+> 更新时间：2026-09-25 · 状态：**Phase 1（MVP）核心完成**：三库状态库 + 双向同步引擎 + 集成测试 A–E 全过；剩余夸克真实接入（DR4 扫码）
 
 ---
 
@@ -237,7 +237,43 @@ cd D:\0Code\Onerclone
 
 ## 8. 后续 Phase 划分
 
-- **Phase 0（Spike）**：§6/§7，目标全链路 + 3 个开放事实全绿
-- **Phase 1（MVP）**：SQLite 状态库（抄 aliyunpan 三库模型）、云端轮询落地（Q6 语义）、删除同步（DR2 基线保护）、断网/补传、分类重试队列、回声过滤打磨、接入真实夸克 remote（扫码登录 DR4）
+- **Phase 0（Spike）**：✅ 完成（全链路 + 开放事实 + 图标验收，见 §6）
+- **Phase 1（MVP）**：**核心完成（2026-09-25）**，详见 §9；剩余：夸克真实 remote 接入（DR4 扫码登录）、rcd 断线自动重启、离线弹窗肉眼验收
 - **Phase 2**：托盘 + Web 面板（队列/冲突/扫码/脱水管理）、冲突副本可视化
 - **Phase 3**：打包（Inno）、开机自启、双机实测、10 万文件性能压测
+
+## 9. Phase 1 进度（2026-09-25）
+
+### ✅ 已完成并测试
+
+| 模块 | 内容 | 验证 |
+|---|---|---|
+| `internal/state` | SQLite 三库（local_snap/cloud_snap/queue + meta），modernc 纯 Go（Q13）、WAL、单写者；队列幂等入队（path+kind 唯一、inflight 保护）、崩溃回收 ReapInflight、四类分类重试（Q16：network 指数退避封顶 300s+抖动无限重试 / rate_limit 60s×n / auth→failed 停队列 / permanent） | 单测 5/5 ✓ |
+| `internal/engine` | 双向 diff（Scan/Poll 三方对账）；**动作互斥升级**（upload∩pending download → conflict，Q18 冲突优先）+ CancelOthers 抢占 + 前复查兜底（upload 查云端 mtime、download 查本地、删除查双侧复活）；DR2 基线门；快照即回声防护（结构性消除 P0 selfWrite 坑） | 单测 7/7 ✓ |
+| `cmd/spike` 接线 | state.db 初始化、首轮基线（Scan+Poll）、RunWorker、Q15 分层轮询（活跃 60s/空闲 5min/12h 对账 + 本地事件 kick 立即对账）、watcher 防抖→engine.Scan、adapters.go（cloudRC/localFS 注入 cfapi+rclone） | 集成 A–E ✓ |
+| rclone RC 扩展 | Stat/DeleteFile/Mkdir/Purge/ListRecursive | ✓ |
+
+### ✅ 生产集成测试（local 后端全链路，2026-09-25）
+
+- **A 本地改→上传**：hello.txt → copyfile → 云端一致 ✓
+- **B 云端改→下载**：spike-remote 直改 → Poll → 本地占位符重建 → 内容一致 ✓（修了**下载回环 bug**：local_snap 必须写本地实际 stat 而非云端 mtime，否则下轮误判回环上传）
+- **C 本地删→云端删**：0.8s 传播 ✓；批量删 5 文件全传播 ✓
+- **D 云端删→本地删**：✓（删除回声被快照吸收，无误入队）
+- **E 双改→冲突双保留（Q7/Q18）**：本地版留原名上传 + 云端版存 `nested (冲突 时间).txt` + 副本自动回传云端 → **本地/云端各两份** ✓
+- 状态库跨重启持久化（重启入队 0）✓；目录走 Mkdir 非 copyfile ✓
+
+### 🕳 P1 踩坑（写后续代码前必读）
+
+8. **快照语义=三方对账的唯一真相**：`local_snap/cloud_snap` 记录"上次观测"，conflict 不能在 Scan/Poll 单侧判定（信息不足）——主裁决=**动作互斥升级**（两侧 pending 相遇），兜底=exec 前复查。曾因 Scan 把"云端快照存在"误判为"云端变过"→ 每次本地修改都错误走 conflict。
+9. **execDownload 快照对齐 bug**：local_snap 写云端 mtime → 占位符实际 mtime 不同 → 下轮 Scan 误判"本地改"→ 回环上传+多余水合。**local_snap=本地实际 stat，cloud_snap=云端观测**，各归各。
+10. **交错 replace_string_in_file 会产出残缺结构**（两次局部替换撞车 → 混入残缺注释 + 花括号错位，编译错误行号还滞后于根因）。诊断：gofmt 首错在 func 行 = 前文函数体未闭合；用 `go/parser` + 深度状态机（跳过字符串/注释）定位。修复后必须跑全量测试。
+11. **单侧动作与删除互斥的边缘**：pending upload 会挡住 delete_local（localChanged=true 走复活分支）——语义=Q18 宁复活，可接受；测试需先 drain 首轮动作再断言删除。
+12. **旧 spike 进程占连接**：CF 同步根同时只能一个 provider 连接（0x8007017A "already connected"）；重启测试前必须 `Stop-Process -Name spike`。
+
+### ⬜ Phase 1 剩余
+
+- [ ] **夸克真实 remote 接入（DR4）**：rclone config quark remote + 扫码登录流程 + cookie 过期→auth 分类停队列已就绪（引擎侧完成，差 remote 配置与登录 UI）
+- [ ] rcd 断线自动重启（FR5 完整闭环：现在 rcd 死后队列会退避但 rcd 不会自己回来）
+- [ ] 离线模式（`-offline`）肉眼验收（P0 遗留）
+- [ ] Q6 完整语义：曾水合文件云端变更后**主动**重拉数据（现在是懒水合：删旧重建占位符，读时拉最新——内容正确但离线窗口内不可读）
+- [ ] `sub` 目录占位符预热 0x80070057（INVALID_PARAMETER）待查——目录转占位符的参数问题，引擎的 download 建目录路径未受影响

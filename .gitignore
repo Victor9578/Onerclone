@@ -1,0 +1,22 @@
+# 构建产物
+/spike.exe
+/spike.exe~
+
+# 运行时
+spike.log
+brace_depth.txt
+*.state/
+
+# 诊断临时程序
+tmp_line/
+tmp_stat/
+
+# 验证截图（保留 final_zoom/verify_final 作验收证据，其余不入库）
+explorer_*.png
+onedrive_*.png
+files_zoom.png
+final_full.png
+srm.reg
+captured_*.reg
+watchlog.txt
+child_probe.*

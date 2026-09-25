@@ -187,6 +187,73 @@ func (c *Client) CopyFile(srcFs, srcRemote, dstFs, dstRemote string) error {
 		"dstRemote": dstRemote,
 	}, nil)
 }
+// DeleteFile 删除单个远端文件。
+func (c *Client) DeleteFile(fs, remote string) error {
+	return c.postJSON("/operations/deletefile", map[string]any{
+		"fs":     fs,
+		"remote": remote,
+	}, nil)
+}
+
+// Mkdir 创建远端目录（幂等）。
+func (c *Client) Mkdir(fs, remote string) error {
+	return c.postJSON("/operations/mkdir", map[string]any{
+		"fs":     fs,
+		"remote": remote,
+	}, nil)
+}
+
+// Purge 递归删除远端目录（P1 用于云端目录删除；rclone 语义同 rm -r）。
+func (c *Client) Purge(fs, remote string) error {
+	return c.postJSON("/operations/purge", map[string]any{
+		"fs":     fs,
+		"remote": remote,
+	}, nil)
+}
+
+// ListRecursive 深度优先递归列举 remote 下全部条目（含子目录）。
+// 返回的 Path 均相对 fs 根、正斜杠。Q3 规模 10 万文件逐层列举，
+// P1 可接受；后续可换更高效的批量接口（Q15c 优化项）。
+func (c *Client) ListRecursive(fs, remote string) ([]Entry, error) {
+	var out []Entry
+	queue := []string{remote}
+	for len(queue) > 0 {
+		dir := queue[0]
+		queue = queue[1:]
+		entries, err := c.List(fs, dir)
+		if err != nil {
+			return nil, fmt.Errorf("list %q: %w", dir, err)
+		}
+		for _, e := range entries {
+			if e.IsDir {
+				queue = append(queue, e.Path)
+			}
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+// Stat 查询单个远端条目（上传前复查云端 mtime 用，aliyunpan 借鉴点）。
+// 不存在返回 (nil, nil)。
+func (c *Client) Stat(fs, remote string) (*Entry, error) {
+	var out struct {
+		Item *Entry `json:"item"`
+	}
+	err := c.postJSON("/operations/stat", map[string]any{
+		"fs":     fs,
+		"remote": remote,
+	}, &out)
+	if err != nil {
+		// rclone 对不存在的路径返回 404/doesn't exist 错误体
+		if strings.Contains(err.Error(), "directory not found") ||
+			strings.Contains(err.Error(), "object not found") ||
+			strings.Contains(err.Error(), "404") {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return out.Item, nil
+}
 
 // Version 返回 rclone 版本信息，用于就绪探测。
 func (c *Client) Version() (map[string]any, error) {
