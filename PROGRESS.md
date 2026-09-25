@@ -272,7 +272,10 @@ cd D:\0Code\Onerclone
 
 ### ⬜ Phase 1 剩余
 
-- [ ] **夸克真实 remote 接入（DR4）**：rclone config quark remote + 扫码登录流程 + cookie 过期→auth 分类停队列已就绪（引擎侧完成，差 remote 配置与登录 UI）
+- [ ] **夸克真实 remote（DR4）**：代码层完成（`spike quark-login` + `run -remote quark:`），**待用户真 TTY 扫码**
+  - 取证结论：QR 状态机入口 = `rclone config create quark quark`（非 reconnect——quark 非 OAuth，实测 "backend doesn't support reconnect"）；流程第一步（网络建 `config_qr_session`）已验证落盘；survey 终端 UI **必须真 TTY**（管道下静默挂起），自动化环境无法完成扫码
+  - cookie 过期 → 引擎 auth 分类停队列 + 日志提醒重扫码 ✓（引擎侧完成）
+  - rclone.conf 已有 `[quark]` 骨架 + QR session；`spike quark-login` 走 delete+create 全新扫码
 - [ ] rcd 断线自动重启（FR5 完整闭环：现在 rcd 死后队列会退避但 rcd 不会自己回来）
 - [ ] 离线模式（`-offline`）肉眼验收（P0 遗留）
 - [ ] Q6 完整语义：曾水合文件云端变更后**主动**重拉数据（现在是懒水合：删旧重建占位符，读时拉最新——内容正确但离线窗口内不可读）

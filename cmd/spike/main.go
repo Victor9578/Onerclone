@@ -109,6 +109,8 @@ func main() {
 		cmdUnregister(os.Args[2:])
 	case "run":
 		cmdRun(os.Args[2:])
+	case "quark-login":
+		cmdQuarkLogin(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -119,9 +121,10 @@ func usage() {
 	fmt.Println(`onerclone spike —— Cloud Files API 全链路验证
 
 用法:
-  spike register   [-root DIR]              注册同步根（以当前权限尝试）
+  spike register   [-root DIR]              注册同步根（内核 + Shell 图标层）
   spike unregister [-root DIR]              注销同步根
-  spike run        [-root DIR] [-fs DIR] [-rclone EXE] [-offline]
+  spike quark-login                          扫码登录夸克（DR4，需真实控制台）
+  spike run        [-root DIR] [-fs DIR] [-remote quark:] [-rclone EXE] [-offline]
 
 测试脚本 (run 起来后):
   1. 资源管理器打开同步根 → 检查云朵图标
@@ -218,15 +221,22 @@ func cmdRun(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	root := fs.String("root", defaultRoot(), "同步根目录")
 	fsDir := fs.String("fs", defaultFs(), "云端替身目录（rclone local 后端）")
+	remote := fs.String("remote", "", "真实 rclone remote（如 quark:）；非空时覆盖 -fs（DR4）")
 	rcloneExe := fs.String("rclone", `D:\Software\rclone\rclone.exe`, "rclone 可执行文件")
 	offline := fs.Bool("offline", false, "离线模式：水合请求立即快速失败")
 	_ = fs.Parse(args)
 
+	dstFs := filepath.ToSlash(*fsDir)
+	if *remote != "" {
+		dstFs = quarkRemoteFlag(*remote)
+		log.Printf("☁️ 使用真实 remote: %s（需已 quark-login）", dstFs)
+	}
+
 	a := &app{
-		syncRoot:  *root,
-		fsRoot:    filepath.ToSlash(*fsDir),
-		offline:   *offline,
-		pollKick:  make(chan struct{}, 1),
+		syncRoot: *root,
+		fsRoot:   dstFs,
+		offline:  *offline,
+		pollKick: make(chan struct{}, 1),
 	}
 
 	// 1) 验证平台可用
@@ -236,9 +246,11 @@ func cmdRun(args []string) {
 		log.Printf("Cloud Files 平台版本: build=%d rev=%d int=%d", v.BuildNumber, v.RevisionNumber, v.IntegrationNumber)
 	}
 
-	// 2) 准备数据与本地目录
-	if err := ensureSample(a.fsRoot); err != nil {
-		log.Fatalf("准备示例数据失败: %v", err)
+	// 2) 准备数据与本地目录（本地替身模式才写示例；真实 remote 不动云端）
+	if *remote == "" {
+		if err := ensureSample(a.fsRoot); err != nil {
+			log.Fatalf("准备示例数据失败: %v", err)
+		}
 	}
 	if err := os.MkdirAll(a.syncRoot, 0o755); err != nil {
 		log.Fatalf("创建同步根失败: %v", err)
