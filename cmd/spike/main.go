@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -58,9 +59,10 @@ const (
 type app struct {
 	syncRoot string // 本地同步根（NTFS）
 	fsRoot   string // "云端"替身：rclone 以 local 后端服务的目录（正斜杠）
-	rc       *rclone.Client
-	session  *cfapi.Session
-	offline  bool
+	// RC 客户端（atomic 热替换：rcd 断线自动重启后换新，FR5）
+	rc      atomic.Pointer[rclone.Client]
+	session *cfapi.Session
+	offline bool
 
 	// P1 引擎（双向同步：快照 diff + 动作队列）
 	eng   *engine.Engine
@@ -256,18 +258,48 @@ func cmdRun(args []string) {
 		log.Fatalf("创建同步根失败: %v", err)
 	}
 
-	// 3) 启动 rclone rcd 子进程
+	// 3) 启动 rclone rcd 子进程（FR5：断线自动重启 + client 热替换）
+	cloud := &cloudRC{srcFs: a.syncRoot, dstFs: a.fsRoot}
 	daemon, err := rclone.StartRcd(*rcloneExe)
 	if err != nil {
 		log.Fatalf("启动 rclone rcd 失败: %v", err)
 	}
-	defer daemon.Stop()
-	a.rc = daemon.Client
+	var curDaemon atomic.Pointer[rclone.Daemon]
+	curDaemon.Store(daemon)
+	defer func() { // 闭包捕获 holder（直接 defer daemon.Stop 会绑定旧实例）
+		if d := curDaemon.Load(); d != nil {
+			d.Stop()
+		}
+	}()
+	a.rc.Store(daemon.Client)
+	cloud.SetClient(daemon.Client)
 	log.Printf("rclone rcd 就绪: %s", daemon.Client.Base)
-	// 监控 rcd 子进程意外退出（上传 connection refused 的根因排查）
+	// 监控 rcd 退出 → 指数退避自动重启（5s→10s→20s→30s 封顶，无限重试），
+	// 重启成功后热替换 client：引擎/水合回调无感知，队列在退避期间自动挂起恢复
 	go func() {
-		err := <-daemon.Exited
-		log.Printf("✗ rclone rcd 子进程已退出: %v\n--- rcd 输出 ---\n%s", err, daemon.Output())
+		for {
+			d := curDaemon.Load()
+			err := <-d.Exited
+			log.Printf("✗ rclone rcd 退出: %v，5s 后自动重启\n--- 输出 ---\n%s",
+				err, trimOutput(d.Output()))
+			backoff := 5 * time.Second
+			for {
+				time.Sleep(backoff)
+				if backoff < 30*time.Second {
+					backoff *= 2
+				}
+				nd, err := rclone.StartRcd(*rcloneExe)
+				if err != nil {
+					log.Printf("⚠ rcd 重启失败（%v），退避后重试", err)
+					continue
+				}
+				curDaemon.Store(nd)
+				a.rc.Store(nd.Client)
+				cloud.SetClient(nd.Client)
+				log.Printf("✅ rclone rcd 已重启: %s", nd.Client.Base)
+				break
+			}
+		}
 	}()
 
 	// 4) 确保注册策略为最新（Population=ALWAYS_FULL 需重新注册才生效），
@@ -302,7 +334,7 @@ func cmdRun(args []string) {
 	log.Printf("状态库: %s", statePath)
 
 	a.eng = engine.New(a.store,
-		&cloudRC{rc: a.rc, srcFs: a.syncRoot, dstFs: a.fsRoot},
+		cloud,
 		&localFS{root: a.syncRoot}, log.Default())
 
 	// 6) 首轮基线：本地扫描 + 云端轮询 → 建立三库快照（DR2 之前无删除）
@@ -362,9 +394,18 @@ func cmdRun(args []string) {
 	log.Print("退出中…")
 }
 
+// trimOutput 截断 rcd 输出日志（防止刷屏）。
+func trimOutput(s string) string {
+	const max = 2000
+	if len(s) <= max {
+		return s
+	}
+	return "..." + s[len(s)-max:]
+}
+
 // populate 递归列举远程目录并在本地创建占位符，返回文件数。
 func (a *app) populate(remoteRel, localDir string) (int, error) {
-	entries, err := a.rc.List(a.fsRoot, remoteRel)
+	entries, err := a.rc.Load().List(a.fsRoot, remoteRel)
 	if err != nil {
 		return 0, fmt.Errorf("list %q: %w", remoteRel, err)
 	}
@@ -484,7 +525,7 @@ func (a *app) handleFetchData(info *cfapi.CallbackInfo, params *cfapi.CallbackPa
 	//（Add-Content 先触发水合再落盘 → WRITE 事件被误抑制 → 上传丢失）。
 
 	t0 := time.Now()
-	data, err := a.rc.RangeGet(a.fsRoot, rel, off, end)
+	data, err := a.rc.Load().RangeGet(a.fsRoot, rel, off, end)
 	if err != nil {
 		log.Printf("✗ 取数失败 %s: %v", base, err)
 		_ = a.session.FailTransfer(info, off, reqLen, cfapi.StatusCloudFileNetworkUnavailable)

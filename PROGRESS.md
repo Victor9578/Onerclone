@@ -276,7 +276,7 @@ cd D:\0Code\Onerclone
   - 取证结论：QR 状态机入口 = `rclone config create quark quark`（非 reconnect——quark 非 OAuth，实测 "backend doesn't support reconnect"）；流程第一步（网络建 `config_qr_session`）已验证落盘；survey 终端 UI **必须真 TTY**（管道下静默挂起），自动化环境无法完成扫码
   - cookie 过期 → 引擎 auth 分类停队列 + 日志提醒重扫码 ✓（引擎侧完成）
   - rclone.conf 已有 `[quark]` 骨架 + QR session；`spike quark-login` 走 delete+create 全新扫码
-- [ ] rcd 断线自动重启（FR5 完整闭环：现在 rcd 死后队列会退避但 rcd 不会自己回来）
+- [x] ~~rcd 断线自动重启（FR5 完整闭环）~~ → **✅ 2026-09-25 实测**：杀 rclone → 5s 首档退避自动重启（5→10→20→30s 封顶无限重试）→ `atomic.Pointer` client 热替换（引擎/水合无感知）→ 杀后入队的上传在恢复后成功落到云端。证据见 `cloudRC.SetClient` + run 内监控循环
 - [ ] 离线模式（`-offline`）肉眼验收（P0 遗留）
 - [ ] Q6 完整语义：曾水合文件云端变更后**主动**重拉数据（现在是懒水合：删旧重建占位符，读时拉最新——内容正确但离线窗口内不可读）
 - [ ] `sub` 目录占位符预热 0x80070057（INVALID_PARAMETER）待查——目录转占位符的参数问题，引擎的 download 建目录路径未受影响
