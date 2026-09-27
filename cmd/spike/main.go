@@ -68,6 +68,9 @@ type app struct {
 	eng   *engine.Engine
 	store *state.Store
 
+	// 云端名↔本地名 映射（DR4 方案 A：Windows 非法字符），见 namemap.go
+	nm *nameMap
+
 	// watcher 防抖后踢 pollLoop 立即轮询（本地有活动 = 活跃期语义）
 	pollKick chan struct{}
 
@@ -92,17 +95,72 @@ func defaultFs() string {
 	return abs
 }
 
-func main() {
-	// 日志同时输出到控制台与 spike.log（排查用：控制台会被回调刷屏）
-	logFile, err := os.OpenFile("spike.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err == nil {
-		defer logFile.Close()
-		log.SetOutput(io.MultiWriter(os.Stdout, logFile))
+// setConsoleUTF8 把控制台输入/输出代码页设为 UTF-8（65001）。
+// Go 输出的是 UTF-8，传统 conhost（chcp 936）会把中文日志渲染成乱码；
+// 幂等调用，无控制台（服务/重定向）时静默失败。
+func setConsoleUTF8() {
+	kernel32 := syscall.NewLazyDLL("kernel32.dll")
+	const cpUTF8 = 65001
+	_, _, _ = kernel32.NewProc("SetConsoleOutputCP").Call(cpUTF8)
+	_, _, _ = kernel32.NewProc("SetConsoleCP").Call(cpUTF8)
+}
+
+// isInfoCmd 判断是否是纯信息类命令（不写日志、不读配置）。
+func isInfoCmd(arg string) bool {
+	switch arg {
+	case "version", "-version", "--version", "help", "-h", "--help":
+		return true
 	}
-	log.SetFlags(log.Ltime | log.Lmicroseconds)
+	return false
+}
+
+// 版本信息：build.ps1 用 -ldflags "-X main.version=... -X main.buildDate=..." 注入。
+var (
+	version   = "dev"
+	buildDate = "unknown"
+)
+
+// printVersion 输出版本号（`onerclone version`）。
+func printVersion() {
+	fmt.Printf("onerclone %s (build %s)\n", version, buildDate)
+}
+
+// panelURL 是当前面板一次性链接（托盘“打开面板”用；每次启动换新）。
+var panelURL atomic.Value
+
+// trayQuit 由托盘“退出”菜单触发（与 Ctrl+C 等价）。
+var trayQuit = make(chan struct{})
+
+// logFilePath 是当前日志路径（托盘“打开日志”用）。
+var logFilePath atomic.Value
+
+func main() {
+	// 控制台代码页改 UTF-8：Go 输出的是 UTF-8，而传统 conhost（chcp 936）
+	// 会把中文日志渲染成乱码。不改也能跑，只是显示问题（实测 help 输出字节合法）
+	setConsoleUTF8()
+
+	// version/help 是纯信息命令：不落日志（否则在发布目录跑一次版本号
+	// 就会在 exe 旁留个 onerclone.log，污染打包产物）
+	if len(os.Args) < 2 || !isInfoCmd(os.Args[1]) {
+		// 日志同时输出到控制台与 onerclone.log（排查用：控制台会被回调刷屏）。
+		// 路径固定在 **exe 同目录**（相对路径会跟着启动时的 CWD 跑偏）。
+		logPath := "onerclone.log"
+		if exe, err := os.Executable(); err == nil && exe != "" {
+			logPath = filepath.Join(filepath.Dir(exe), "onerclone.log")
+		}
+		logFilePath.Store(logPath)
+		logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err == nil {
+			defer logFile.Close()
+			log.SetOutput(io.MultiWriter(os.Stdout, logFile))
+		}
+		log.SetFlags(log.Ltime | log.Lmicroseconds)
+		log.Printf("onerclone %s (build %s)", version, buildDate)
+	}
 	if len(os.Args) < 2 {
-		usage()
-		os.Exit(2)
+		// 成品默认行为：无参数 = 开始同步（配置见 exe 同目录 onerclone.json）
+		cmdRun(nil)
+		return
 	}
 	switch os.Args[1] {
 	case "register":
@@ -113,6 +171,12 @@ func main() {
 		cmdRun(os.Args[2:])
 	case "quark-login":
 		cmdQuarkLogin(os.Args[2:])
+	case "autostart":
+		cmdAutostart(os.Args[2:])
+	case "version", "-version", "--version":
+		printVersion()
+	case "help", "-h", "--help":
+		usage()
 	default:
 		usage()
 		os.Exit(2)
@@ -120,19 +184,28 @@ func main() {
 }
 
 func usage() {
-	fmt.Println(`onerclone spike —— Cloud Files API 全链路验证
+	fmt.Printf(`onerclone %s —— 夸克网盘 Windows 原生同步（Cloud Files 占位符）
 
 用法:
-  spike register   [-root DIR]              注册同步根（内核 + Shell 图标层）
-  spike unregister [-root DIR]              注销同步根
-  spike quark-login                          扫码登录夸克（DR4，需真实控制台）
-  spike run        [-root DIR] [-fs DIR] [-remote quark:] [-rclone EXE] [-offline]
+  onerclone                    直接开始同步（读 exe 同目录 onerclone.json）
+  onerclone run [flags]        同上，flag 可覆盖配置
+  onerclone quark-login        扫码登录夸克（需真实控制台；-tries N 超时自动重出二维码）
+  onerclone autostart          查询开机自启；-enable/-disable 开关
+  onerclone register   [-root DIR]   注册同步根（内核 + Shell 图标层）
+  onerclone unregister [-root DIR]   注销同步根
+  onerclone version            版本信息
+  onerclone help               本帮助
 
-测试脚本 (run 起来后):
-  1. 资源管理器打开同步根 → 检查云朵图标
-  2. 记事本打开 hello.txt → 应秒开并显示内容（水合链路）
-  3. 修改 hello.txt 保存 → 终端 3s 后出现“⬆ 上传”日志 → 核对 fs 目录内容
-  4. Ctrl+C 退出，带 -offline 重跑 → 打开 big.bin → 应立即报错（不卡死）`)
+run 的 flag（均覆盖配置）:
+  -root DIR      同步根（必须 NTFS）
+  -remote ADDR   rclone remote（如 quark:）；空=读配置，配置空=用 -fs 本地替身
+  -fs DIR        本地替身目录（仅 remote 为空时）
+  -rclone EXE    rclone 可执行文件（默认：配置 > exe 同目录 > PATH）
+  -offline       离线模式：水合请求立即快速失败
+
+配置: exe 同目录 onerclone.json（首次运行自动生成模板）
+日志: 同目录 onerclone.log（控制台 + 文件双写）
+`, version)
 }
 
 // ---------- register / unregister ----------
@@ -156,8 +229,9 @@ func isElevated() bool {
 
 func cmdRegister(args []string) {
 	fs := flag.NewFlagSet("register", flag.ExitOnError)
-	root := fs.String("root", defaultRoot(), "同步根目录（必须在 NTFS 上）")
+	root := fs.String("root", "", "同步根目录（必须在 NTFS 上；默认读 onerclone.json）")
 	_ = fs.Parse(args)
+	*root = pick(*root, loadConfig().SyncRoot, defaultRoot())
 
 	if err := os.MkdirAll(*root, 0o755); err != nil {
 		log.Fatalf("创建同步根失败: %v", err)
@@ -206,8 +280,9 @@ func cmdRegister(args []string) {
 
 func cmdUnregister(args []string) {
 	fs := flag.NewFlagSet("unregister", flag.ExitOnError)
-	root := fs.String("root", defaultRoot(), "同步根目录")
+	root := fs.String("root", "", "同步根目录（默认读 onerclone.json）")
 	_ = fs.Parse(args)
+	*root = pick(*root, loadConfig().SyncRoot, defaultRoot())
 	if err := cfapi.UnregisterSyncRoot(*root); err != nil {
 		log.Fatalf("注销失败（若程序在跑请先退出）: %v", err)
 	}
@@ -221,12 +296,22 @@ func cmdUnregister(args []string) {
 
 func cmdRun(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	root := fs.String("root", defaultRoot(), "同步根目录")
-	fsDir := fs.String("fs", defaultFs(), "云端替身目录（rclone local 后端）")
-	remote := fs.String("remote", "", "真实 rclone remote（如 quark:）；非空时覆盖 -fs（DR4）")
-	rcloneExe := fs.String("rclone", `D:\Software\rclone\rclone.exe`, "rclone 可执行文件")
-	offline := fs.Bool("offline", false, "离线模式：水合请求立即快速失败")
+	root := fs.String("root", "", "同步根目录（默认读 onerclone.json）")
+	fsDir := fs.String("fs", "", "云端替身目录（rclone local 后端；默认读配置）")
+	remote := fs.String("remote", "", "真实 rclone remote（如 quark:）；空=读配置，配置空=用 -fs")
+	rcloneExe := fs.String("rclone", "", "rclone 可执行文件（默认：配置 > exe 同目录 > PATH）")
+	offline := fs.Bool("offline", false, "离线模式：水合请求立即快速失败（覆盖配置）")
 	_ = fs.Parse(args)
+
+	// 优先级：flag > onerclone.json > 内置默认（成品化）
+	cfg := loadConfig()
+	*root = pick(*root, cfg.SyncRoot, defaultRoot())
+	*fsDir = pick(*fsDir, cfg.Fs, defaultFs())
+	if *remote == "" {
+		*remote = cfg.Remote
+	}
+	*offline = *offline || cfg.Offline
+	*rcloneExe = resolveRclone(*rcloneExe, cfg.Rclone)
 
 	dstFs := filepath.ToSlash(*fsDir)
 	if *remote != "" {
@@ -333,9 +418,30 @@ func cmdRun(args []string) {
 	defer a.store.Close()
 	log.Printf("状态库: %s", statePath)
 
+	// 云端名↔本地名 映射表（从 meta 恢复上次的改名记录）
+	a.nm = newNameMap(a.store)
+	cloud.nm = a.nm
+
 	a.eng = engine.New(a.store,
 		cloud,
-		&localFS{root: a.syncRoot}, log.Default())
+		&localFS{root: a.syncRoot, nm: a.nm}, log.Default())
+
+	// 5.5) 本地 Web 面板（Phase 2 Q8/Q14：一次性 token + embed 单页 + 管理动作）
+	if pn, err := startPanel(a.store, a.eng, a.syncRoot, a.fsRoot, a.offline); err != nil {
+		log.Printf("⚠ 本地面板启动失败（不影响同步）: %v", err)
+	} else {
+		defer pn.Close()
+		panelURL.Store(pn.URL())
+		log.Printf("🌐 本地面板（一次性链接，重启失效）: %s", pn.URL())
+	}
+
+	// 托盘常驻（Phase 2）：失败/无交互桌面只影响图标，不影响同步
+	trayRoot.Store(a.syncRoot)
+	if v, ok := logFilePath.Load().(string); ok {
+		trayLog.Store(v)
+	}
+	startTray()
+	log.Print("📌 托盘已启动：打开面板 / 同步根 / 日志 / 退出（右键图标）")
 
 	// 6) 首轮基线：本地扫描 + 云端轮询 → 建立三库快照（DR2 之前无删除）
 	if n, err := a.eng.Scan(); err != nil {
@@ -344,7 +450,12 @@ func cmdRun(args []string) {
 		log.Printf("首轮本地扫描：入队 %d", n)
 	}
 	if n, err := a.eng.Poll(); err != nil {
-		log.Fatalf("首轮云端轮询失败（基线无法建立）: %v", err)
+		// 成品化：首轮失败不再直接退出——基线未建立时 DR2 会保护删除/覆盖，
+		// 后续 pollLoop 会自动重试（最常见原因是夸克未登录/cookie 过期）
+		log.Printf("⚠ 首轮云端轮询失败（基线未建立，DR2 保护仍生效，后续轮询自动补）: %v", err)
+		if *remote != "" {
+			log.Print("→ 若是登录问题（未扫码 / cookie 过期），请先运行: onerclone quark-login")
+		}
 	} else {
 		log.Printf("首轮云端轮询：入队 %d", n)
 	}
@@ -390,6 +501,7 @@ func cmdRun(args []string) {
 	select {
 	case <-quit:
 	case <-sig:
+	case <-trayQuit:
 	}
 	log.Print("退出中…")
 }
@@ -412,8 +524,10 @@ func (a *app) populate(remoteRel, localDir string) (int, error) {
 	total := 0
 	var items []cfapi.NewPlaceholder
 	for _, e := range entries {
+		// 云端名 → 本地名（Windows 非法字符映射，与 localFS.ApplyDownload 同源）
+		lname := a.nm.localSeg(e.Name)
 		if e.IsDir {
-			sub := filepath.Join(localDir, e.Name)
+			sub := filepath.Join(localDir, lname)
 			if err := os.MkdirAll(sub, 0o755); err != nil {
 				return total, err
 			}
@@ -425,7 +539,7 @@ func (a *app) populate(remoteRel, localDir string) (int, error) {
 			continue
 		}
 		items = append(items, cfapi.NewPlaceholder{
-			RelativeFileName: e.Name,
+			RelativeFileName: lname,
 			FileSize:         e.Size,
 			ModTime:          e.ModTime,
 			Flags:            cfapi.PlaceholderCreateFlagMarkInSync,
@@ -702,7 +816,8 @@ func (a *app) rel(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.ToSlash(r), nil
+	// 本地名 → 云端原名：水合回填要按云端名取数（本地名可能被改过）
+	return a.nm.cloudPath(filepath.ToSlash(r)), nil
 }
 
 // ensureSample 在云端替身目录里准备验证数据。

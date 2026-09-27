@@ -17,6 +17,7 @@ package state
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // 纯 Go 驱动，注册 database/sql 驱动名 "sqlite"
@@ -31,6 +32,7 @@ const (
 	KindDeleteCloud ActionKind = "delete_cloud" // 本地删除 → 删云端（受 DR2 基线保护）
 	KindDeleteLocal ActionKind = "delete_local" // 云端删除 → 删本地（曾水合且未改才允许）
 	KindConflict    ActionKind = "conflict"     // 双方都改 → 双保留冲突副本（Q7/Q18）
+	KindDehydrate   ActionKind = "dehydrate"    // 面板“脱水”：删本地数据重建占位符（Q6 不重拉）
 )
 
 // ActionState 是动作生命周期状态。
@@ -411,6 +413,20 @@ func (s *Store) Stats() (map[ActionState]int, error) {
 	return out, rows.Err()
 }
 
+// Retry 把动作重置为立即可执行（面板“重试”）：清空尝试次数与错误，回到 pending。
+func (s *Store) Retry(id int64) error {
+	_, err := s.db.Exec(
+		`UPDATE queue SET state='pending', class='network', attempts=0, next_try=0,
+		 last_err='', updated=? WHERE id=?`, time.Now().UnixNano(), id)
+	return err
+}
+
+// Drop 直接移除动作（面板“放弃”）。
+func (s *Store) Drop(id int64) error {
+	_, err := s.db.Exec(`DELETE FROM queue WHERE id=?`, id)
+	return err
+}
+
 // CancelOthers 把同路径除 keep 外的 pending 动作置为 done（last_err 标记
 // superseded）。用于 Q18 冲突优先：conflict 入队时吞掉同路径的其他待执行动作。
 // inflight 不动（正在执行），done/failed 不动。
@@ -423,6 +439,54 @@ func (s *Store) CancelOthers(path string, keep ActionKind) (int64, error) {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// ListActions 列出队列动作（本地面板/诊断用，不改状态）。
+// states 为空 → 除 done 外的全部；limit<=0 → 200。按 updated 倒序。
+func (s *Store) ListActions(states []ActionState, limit int) ([]Action, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	var (
+		where string
+		args  []any
+	)
+	if len(states) == 0 {
+		where = `state<>'done'`
+	} else {
+		ph := make([]string, len(states))
+		for i, st := range states {
+			ph[i] = "?"
+			args = append(args, string(st))
+		}
+		where = `state IN (` + strings.Join(ph, ",") + `)`
+	}
+	args = append(args, limit)
+	rows, err := s.db.Query(
+		`SELECT id,path,kind,state,class,attempts,next_try,last_err,created,updated
+		 FROM queue WHERE `+where+` ORDER BY updated DESC LIMIT ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Action
+	for rows.Next() {
+		var a Action
+		var next, created, updated int64
+		var kind, st, class string
+		if err := rows.Scan(&a.ID, &a.Path, &kind, &st, &class,
+			&a.Attempts, &next, &a.LastErr, &created, &updated); err != nil {
+			return nil, err
+		}
+		a.Kind = ActionKind(kind)
+		a.State = ActionState(st)
+		a.Class = RetryClass(class)
+		a.NextTry = time.Unix(0, next)
+		a.EnqueuedAt = time.Unix(0, created)
+		a.UpdatedAt = time.Unix(0, updated)
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 // HasPendingConflict 返回该路径是否已有待执行的 conflict（其他动作让位用）。

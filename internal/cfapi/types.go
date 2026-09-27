@@ -277,11 +277,31 @@ type NewPlaceholder struct {
 	Identity          []byte
 }
 
-// FILETIME 转换：Unix 100ns → 自 1601-01-01 起的 100ns。
-// 偏移 11644473600 秒 = 11644473600000000 个 100ns（先除后加避免溢出）。
+// FILETIME 转换：Unix 时间 → 自 1601-01-01 起的 100ns 单位。
+//
+// 踩坑 #15（0x80070057 真因，两处都踩过）：
+//  1. 偏移必须是 11644473600 秒 × 1e7 = 116444736000000000 个 100ns。
+//     曾少写一个 0（1.16e16）→ 所有占位符时间前移 116 年，且 1960 年以前
+//     的文件算出**负 FILETIME** → CfCreatePlaceholders 判 ERROR_INVALID_PARAMETER，
+//     实测 `big.bin`（mtime 1694-08-19）因此永远下载失败、无限退避重试。
+//  2. 不能用 t.UnixNano()：它只在 1678~2262 有定义，越界直接溢出成垃圾值
+//     （同一根 1694 年样本文件的另一重风险）。改用秒级算术 + 两端饱和。
+//     实测：负 FILETIME → 0x80070057；0/正数 → 正常。
 func toFiletime(t time.Time) int64 {
 	if t.IsZero() {
 		return 0
 	}
-	return t.UnixNano()/100 + 11644473600000000
+	const (
+		offsetSec  = int64(11644473600)          // 1601-01-01 → 1970-01-01 的秒数
+		maxInt64   = int64(1<<63 - 1)
+		maxFTUnits = maxInt64 / 1e7               // 秒级上限（不溢出）
+	)
+	sec := t.Unix()
+	if sec < -offsetSec { // 1601 年之前：无合法表示，退到 0（实测可接受）
+		return 0
+	}
+	if sec > maxFTUnits-offsetSec { // 极远未来：饱和，防止溢出
+		return maxInt64 - 1e7
+	}
+	return (sec+offsetSec)*1e7 + int64(t.Nanosecond())/100
 }

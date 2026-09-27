@@ -49,9 +49,15 @@ func (f *fakeCloud) Mkdir(rel string) error { return nil }
 
 type fakeLocal struct {
 	mu map[string]CloudEntry
+
+	// Q6：这些路径“曾水合”（读过数据），云端变更后引擎应主动重拉
+	hydrated     map[string]bool
+	hydrateCalls []string
 }
 
-func newFakeLocal() *fakeLocal { return &fakeLocal{mu: map[string]CloudEntry{}} }
+func newFakeLocal() *fakeLocal {
+	return &fakeLocal{mu: map[string]CloudEntry{}, hydrated: map[string]bool{}}
+}
 
 func (f *fakeLocal) Scan() ([]CloudEntry, error) {
 	out := []CloudEntry{}
@@ -76,7 +82,11 @@ func (f *fakeLocal) Remove(rel string) error {
 	return nil
 }
 func (f *fakeLocal) FinalizeUpload(rel string) error { return nil }
-func (f *fakeLocal) WasHydrated(rel string) bool     { return false }
+func (f *fakeLocal) WasHydrated(rel string) bool     { return f.hydrated[rel] }
+func (f *fakeLocal) Hydrate(rel string) error {
+	f.hydrateCalls = append(f.hydrateCalls, rel)
+	return nil
+}
 
 // ---------- 工具 ----------
 
@@ -148,7 +158,7 @@ func TestScanUnchangedNoAction(t *testing.T) {
 }
 
 func TestPollNewCloudDownload(t *testing.T) {
-	eng, st, fc, _ := newTestEngine(t)
+	eng, st, fc, fl := newTestEngine(t)
 	mt := time.Now().Add(-time.Hour)
 	fc.mu["b.txt"] = e("b.txt", 20, mt)
 
@@ -166,6 +176,41 @@ func TestPollNewCloudDownload(t *testing.T) {
 	stats, _ := st.Stats()
 	if stats[state.StateDone] != 1 {
 		t.Fatalf("stats=%v", stats)
+	}
+	if len(fl.hydrateCalls) != 0 {
+		t.Fatalf("首轮未水合过，不该重拉: %v", fl.hydrateCalls)
+	}
+}
+
+// TestQ6RereadsPreviouslyHydratedFile —— Q6 完整语义：
+// 曾水合的文件在云端变更后**主动**重拉数据（而非只重建占位符），
+// 下载窗口结束即可离线读；从未水合过的新文件只建占位符（不白拉流量）。
+func TestQ6RereadsPreviouslyHydratedFile(t *testing.T) {
+	eng, _, fc, fl := newTestEngine(t)
+	mt := time.Now().Add(-time.Hour)
+	fc.mu["b.txt"] = e("b.txt", 20, mt)
+
+	// 第一轮：新文件 → 只建占位符，不重拉
+	if n, err := eng.Poll(); err != nil || n != 1 {
+		t.Fatalf("首轮 poll n=%d err=%v", n, err)
+	}
+	drain(t, eng)
+	if len(fl.hydrateCalls) != 0 {
+		t.Fatalf("新文件不该主动重拉: %v", fl.hydrateCalls)
+	}
+
+	// 模拟用户读过 → 已水合
+	fl.hydrated["b.txt"] = true
+
+	// 云端变更 → 下载 → 必须主动重拉
+	fc.mu["b.txt"] = e("b.txt", 30, mt.Add(time.Minute))
+	if n, err := eng.Poll(); err != nil || n != 1 {
+		t.Fatalf("二轮 poll n=%d err=%v", n, err)
+	}
+	drain(t, eng)
+
+	if len(fl.hydrateCalls) != 1 || fl.hydrateCalls[0] != "b.txt" {
+		t.Fatalf("Q6 应主动重拉 b.txt, got %v", fl.hydrateCalls)
 	}
 }
 

@@ -70,6 +70,10 @@ type Local interface {
 	FinalizeUpload(rel string) error
 	// WasHydrated 判断该路径此前是否已水合（Q6：曾水合的自动重新下载）。
 	WasHydrated(rel string) bool
+	// Hydrate 主动把占位符数据拉到本地（Q6）：曾水合的文件在云端变更后
+	// 重新下载，使下载窗口结束即可离线读；实现负责不写快照。
+	// 失败（离线/网络）应返回错误，由引擎降级为“读时懒水合”。
+	Hydrate(rel string) error
 }
 
 // ---------- 引擎 ----------
@@ -532,6 +536,8 @@ func (e *Engine) exec(a state.Action) {
 		err, class = e.execDeleteLocal(a.Path)
 	case state.KindConflict:
 		err, class = e.execConflict(a.Path)
+	case state.KindDehydrate:
+		err, class = e.execDehydrate(a.Path)
 	default:
 		err = fmt.Errorf("未知动作类型 %s", a.Kind)
 		class = state.ClassPermanent
@@ -633,6 +639,13 @@ func (e *Engine) refreshCloudSnapFromLocal(rel string) error {
 
 // execDownload 执行下载（云端新/改落地本地）。
 func (e *Engine) execDownload(rel string) (error, state.RetryClass) {
+	return e.download(rel, true)
+}
+
+// download 落地云端条目：删旧（若有）+ 建占位符 + 对齐快照。
+// allowQ6=false 表示**脱水**：只重建占位符，不触发 Q6 主动重拉
+//（否则刚释放的空间立刻又被拉回来）。
+func (e *Engine) download(rel string, allowQ6 bool) (error, state.RetryClass) {
 	ls, lok, err := e.store.GetSnap("local_snap", rel)
 	if err != nil {
 		return err, state.ClassNetwork
@@ -680,8 +693,28 @@ func (e *Engine) execDownload(rel string) (error, state.RetryClass) {
 	}); err != nil {
 		return err, state.ClassNetwork
 	}
-	e.log.Printf("⬇ 下载完成 %s（曾水合=%v，Q6 自动重拉=%v）", rel, hydrate, hydrate)
+	// Q6：曾水合的文件在云端变更后**主动**重拉数据（而不是只重建占位符），
+	// 下载窗口一结束本地就是最新内容，离线期可读。
+	// 拉不动（离线/失败）不判动作失败：占位符还在，读时懒水合兜底。
+	if hydrate && allowQ6 {
+		if err := e.local.Hydrate(rel); err != nil {
+			e.log.Printf("⚠ Q6 主动重拉失败 %s（保留占位符，读时懒水合兑底）: %v", rel, err)
+		} else {
+			e.log.Printf("🔄 Q6 主动重拉完成 %s（已就地可读）", rel)
+		}
+	}
+	if !allowQ6 {
+		e.log.Printf("🫙 已脱水 %s（本地数据释放，占位符就位）", rel)
+	} else {
+		e.log.Printf("⬇ 下载完成 %s（曾水合=%v，Q6 自动重拉=%v）", rel, hydrate, hydrate)
+	}
 	return nil, state.ClassNetwork
+}
+
+// execDehydrate 面板“脱水”：删本地数据 + 重建占位符（不触发 Q6 重拉）。
+// download 内部会先做“本地已改 → 转 conflict”复查，不丢用户未同步的改动。
+func (e *Engine) execDehydrate(rel string) (error, state.RetryClass) {
+	return e.download(rel, false)
 }
 
 // execDeleteCloud 本地删除 → 删云端。含复活保护（云端若已变 → 改为下载复活）。
@@ -800,6 +833,27 @@ func (e *Engine) execConflict(rel string) (error, state.RetryClass) {
 }
 
 // Stats 返回队列统计（日志/UI）。
+// ---------- 面板操作（Phase 2 管理动作） ----------
+
+// RequestDehydrate 入队脱水动作；文件未水合返回 (false, nil)（无可脱）。
+// 执行时会先复查“本地是否已改”，改过则转 conflict（不丢数据）。
+func (e *Engine) RequestDehydrate(path string) (bool, error) {
+	if !e.local.WasHydrated(path) {
+		return false, nil
+	}
+	_, err := e.enqueue(state.KindDehydrate, path)
+	return err == nil, err
+}
+
+// IsHydrated 判断本地是否有真实数据（面板展示/按钮置灰用）。
+func (e *Engine) IsHydrated(path string) bool { return e.local.WasHydrated(path) }
+
+// RetryAction 把一条动作重置为待执行（面板“重试”）。
+func (e *Engine) RetryAction(id int64) error { return e.store.Retry(id) }
+
+// DropAction 移除一条动作（面板“放弃”）。
+func (e *Engine) DropAction(id int64) error { return e.store.Drop(id) }
+
 func (e *Engine) Stats() (map[state.ActionState]int, error) {
 	return e.store.Stats()
 }

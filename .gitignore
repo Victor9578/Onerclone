@@ -1,6 +1,10 @@
-# 构建产物
+# 构建产物 / build artifacts
 /spike.exe
 /spike.exe~
+/dist/
+/onerclone.log
+/onerclone.json
+/sync/
 
 # 运行时
 spike.log

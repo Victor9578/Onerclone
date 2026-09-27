@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Onerclone 面板</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:20px; background:#0f1115; color:#d7dae0;
+         font:14px/1.5 "Segoe UI",system-ui,sans-serif; }
+  h1 { font-size:18px; margin:0 0 4px; letter-spacing:.5px; }
+  h1 .tag { font-size:12px; font-weight:600; padding:2px 8px; border-radius:10px;
+            margin-left:8px; vertical-align:middle; }
+  .tag.on { background:#12432a; color:#5ade8b; }
+  .tag.off { background:#4a1d1d; color:#ff8b8b; }
+  .sub { color:#8b93a1; font-size:12px; margin-bottom:16px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr));
+           gap:10px; margin-bottom:18px; }
+  .card { background:#171a21; border:1px solid #242833; border-radius:8px; padding:10px 12px; }
+  .card .k { color:#8b93a1; font-size:11px; text-transform:uppercase; letter-spacing:.6px; }
+  .card .v { font-size:16px; margin-top:4px; word-break:break-all; }
+  .card .v.warn { color:#ffb454; }
+  .card .v.bad  { color:#ff8b8b; }
+  .card .v.ok   { color:#5ade8b; }
+  table { width:100%; border-collapse:collapse; background:#171a21;
+          border:1px solid #242833; border-radius:8px; overflow:hidden; }
+  th, td { text-align:left; padding:7px 10px; border-bottom:1px solid #242833;
+           font-size:13px; vertical-align:top; }
+  th { color:#8b93a1; font-weight:600; font-size:11px; text-transform:uppercase; }
+  tr:last-child td { border-bottom:none; }
+  .badge { display:inline-block; padding:1px 7px; border-radius:9px; font-size:11px; }
+  .b-pending { background:#2a3550; color:#9db8ff; }
+  .b-inflight { background:#3c3320; color:#ffd479; }
+  .b-failed { background:#4a1d1d; color:#ff8b8b; }
+  .b-conflict { background:#3f2a4d; color:#d9a6ff; }
+  .b-upload { background:#12432a; color:#5ade8b; }
+  .b-download { background:#123a4a; color:#7cd4ff; }
+  .b-delete_cloud,.b-delete_local { background:#333; color:#c9ccd3; }
+  .err { color:#ff9c9c; word-break:break-all; }
+  .muted { color:#8b93a1; }
+  .grid { display:grid; grid-template-columns:1.4fr 1fr; gap:16px; margin-top:20px; }
+  @media (max-width:900px){ .grid{ grid-template-columns:1fr; } }
+  h2 { font-size:14px; margin:0 0 8px; }
+  button { background:#2563eb; color:#fff; border:0; border-radius:6px;
+           padding:6px 14px; font-size:13px; cursor:pointer; }
+  button:hover { background:#1d4ed8; }
+  button.ghost { background:#242833; color:#c9ccd3; }
+  button.ghost:hover { background:#2f3442; }
+  button:disabled { opacity:.5; cursor:default; }
+  .rowbtns { display:flex; gap:6px; }
+  .rowbtns button { padding:2px 8px; font-size:11px; border-radius:5px; }
+  #qimg { background:#fff; padding:8px; border-radius:8px; width:200px; height:200px; }
+  .hint { color:#8b93a1; font-size:12px; line-height:1.6; }
+  #banner { display:none; background:#4a1d1d; color:#ffd7d7; padding:10px 14px;
+            border-radius:8px; margin-bottom:14px; }
+  footer { margin-top:14px; color:#6b7381; font-size:11px; }
+</style>
+</head>
+<body>
+  <h1>Onerclone<span id="mode" class="tag"></span></h1>
+  <div class="sub" id="sub">加载中…</div>
+  <div id="banner"></div>
+
+  <div class="cards" id="cards"></div>
+
+  <h2 style="font-size:14px;margin:0 0 8px;">队列动作 <span class="muted" id="count"></span></h2>
+  <table>
+    <thead><tr><th style="width:26%">路径</th><th>类型</th><th>状态</th><th>重试</th>
+      <th>下次</th><th style="width:20%">最近错误</th><th style="width:150px">操作</th></tr></thead>
+    <tbody id="rows"><tr><td colspan="7" class="muted">加载中…</td></tr></tbody>
+  </table>
+
+  <div class="grid">
+    <section>
+      <h2>冲突副本（双保留） <span class="muted" id="ccount"></span></h2>
+      <table>
+        <thead><tr><th>原路径</th><th>本地版</th><th>云端版</th><th>本地副本</th><th>云端副本</th></tr></thead>
+        <tbody id="crows"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
+      </table>
+    </section>
+    <section>
+      <h2>夸克扫码登录</h2>
+      <div class="hint">cookie 过期或首次登录时用；扫码确认约 3 分钟内有效。登录成功后引擎会自动恢复队列。</div>
+      <div style="margin-top:10px;display:flex;gap:12px;align-items:flex-start">
+        <img id="qimg" alt="二维码" hidden>
+        <div>
+          <button id="qbtn">开始扫码</button>
+          <div class="hint" id="qmsg" style="margin-top:8px">尚未发起</div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <footer>只读面板 · 127.0.0.1 · 一次性链接已消费，凭 Cookie 访问 · 每 2s 刷新</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmtTime = t => t ? new Date(t).toLocaleString() : '-';
+
+function card(k, v, cls) {
+  return `<div class="card"><div class="k">${k}</div><div class="v ${cls||''}">${v}</div></div>`;
+}
+
+function render(d) {
+  const s = d.status;
+  $('mode').textContent = s.offline ? '离线' : '在线';
+  $('mode').className = 'tag ' + (s.offline ? 'off' : 'on');
+  $('sub').textContent = `${s.sync_root}  →  ${s.fs_root}`;
+
+  const st = s.stats || {};
+  const pending = st.pending || 0, inflight = st.inflight || 0,
+        failed = st.failed || 0, done = st.done || 0;
+  $('cards').innerHTML = [
+    card('基线（DR2）', s.baseline_done ? '已建立 ✓' : '未建立', s.baseline_done ? 'ok' : 'warn'),
+    card('待执行', pending + inflight, pending + inflight ? 'warn' : 'ok'),
+    card('永久失败', failed, failed ? 'bad' : 'ok'),
+    card('认证失败', s.auth_failed, s.auth_failed ? 'bad' : 'ok'),
+    card('已完成（7天）', done),
+    card('运行时长', Math.floor(s.uptime_sec / 60) + ' 分钟'),
+  ].join('');
+
+  const acts = d.actions || [];
+  $('count').textContent = `（${acts.length} 条）`;
+  if (!acts.length) {
+    $('rows').innerHTML = '<tr><td colspan="7" class="muted">队列为空 ✓</td></tr>';
+    return;
+  }
+  $('rows').innerHTML = acts.map(a => `<tr>
+    <td>${esc(a.path)}</td>
+    <td><span class="badge b-${esc(a.kind)}">${esc(a.kind)}</span></td>
+    <td><span class="badge b-${esc(a.state)}">${esc(a.state)}</span>
+        ${a.class && a.class !== 'network' ? `<span class="badge">${esc(a.class)}</span>` : ''}</td>
+    <td>${a.attempts}${a.attempts ? ' 次' : ''}</td>
+    <td class="muted">${a.state === 'pending' && a.next_try ? fmtTime(a.next_try) : '-'}</td>
+    <td class="err">${esc(a.last_err)}</td>
+    <td><div class="rowbtns">
+      <button class="ghost" data-act="retry" data-id="${a.id}">重试</button>
+      <button class="ghost" data-act="drop" data-id="${a.id}">放弃</button>
+      <button class="ghost" data-act="deh" data-path="${esc(a.path)}">脱水</button>
+    </div></td>
+  </tr>`).join('');
+}
+
+function fmtSide(s) {
+  if (!s || !s.present) return '<span class="muted">不存在</span>';
+  return `${s.size} B<br><span class="muted">${new Date(s.mtime).toLocaleString()}</span>`;
+}
+
+async function loadConflicts() {
+  try {
+    const r = await fetch('/api/conflicts');
+    if (!r.ok) return;
+    const cs = (await r.json()).conflicts || [];
+    $('ccount').textContent = `（${cs.length}）`;
+    $('crows').innerHTML = cs.length ? cs.map(c => `<tr>
+      <td>${esc(c.path)}<br><span class="muted">${esc(c.state)}</span></td>
+      <td>${fmtSide(c.local)}</td>
+      <td>${fmtSide(c.cloud)}</td>
+      <td>${(c.local_copies || []).map(esc).join('<br>') || '<span class="muted">-</span>'}</td>
+      <td>${(c.cloud_copies || []).map(esc).join('<br>') || '<span class="muted">-</span>'}</td>
+    </tr>`).join('') : '<tr><td colspan="5" class="muted">无冲突 ✓</td></tr>';
+  } catch (e) { /* 下次再试 */ }
+}
+
+async function rowAction(path, body) {
+  const r = await fetch(path, { method: 'POST',
+    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 409) { alert((j.reason || '') + '：该路径本地没有数据，无需脱水'); return; }
+  if (!r.ok) { alert('操作失败 HTTP ' + r.status + ': ' + (j.err || JSON.stringify(j))); return; }
+  await tick();
+}
+
+document.getElementById('rows').addEventListener('click', e => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  const act = b.dataset.act;
+  if (act === 'retry') rowAction('/api/action/retry', { id: Number(b.dataset.id) });
+  else if (act === 'drop') {
+    if (confirm('放弃这条动作？（只取消任务，不删文件）')) rowAction('/api/action/drop', { id: Number(b.dataset.id) });
+  } else if (act === 'deh') {
+    if (confirm('脱水：释放该文件本地数据、只留占位符？')) rowAction('/api/dehydrate', { path: b.dataset.path });
+  }
+});
+
+// ---------- 扫码登录 ----------
+let qTimer = null;
+function quarkPoll() {
+  clearInterval(qTimer);
+  qTimer = setInterval(async () => {
+    try {
+      const r = await fetch('/api/quark/status');
+      if (!r.ok) return;
+      const j = await r.json();
+      if (j.phase === 'done') {
+        clearInterval(qTimer);
+        $('qimg').hidden = true;
+        $('qmsg').innerHTML = '✅ 登录成功（' + (j.done || '') + '），队列将自动恢复';
+      } else if (j.phase === 'failed') {
+        clearInterval(qTimer);
+        $('qimg').hidden = true;
+        $('qmsg').innerHTML = '❌ 失败：' + esc(j.err || '未知错误');
+      } else if (j.phase === 'waiting') {
+        $('qmsg').textContent = '请用夸克 APP 扫码并在手机上确认…';
+      }
+    } catch (e) { /* 下次再试 */ }
+  }, 2000);
+}
+
+async function quarkStart() {
+  $('qbtn').disabled = true;
+  $('qmsg').textContent = '正在建立扫码会话…';
+  try {
+    const r = await fetch('/api/quark/start', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      $('qmsg').textContent = '失败：' + (j.err || ('HTTP ' + r.status));
+      $('qbtn').disabled = false;
+      return;
+    }
+    $('qimg').src = '/api/quark/qr.png?ts=' + Date.now();
+    $('qimg').hidden = false;
+    $('qbtn').textContent = '重新扫码';
+    $('qbtn').disabled = false;
+    $('qmsg').textContent = '请用夸克 APP 扫码并在手机上确认…';
+    quarkPoll();
+  } catch (e) {
+    $('qmsg').textContent = '失败：' + e;
+    $('qbtn').disabled = false;
+  }
+}
+document.getElementById('qbtn').addEventListener('click', quarkStart);
+// 页面加载时恢复进行中的扫码会话
+(async () => {
+  try {
+    const r = await fetch('/api/quark/status');
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j.phase === 'waiting' && j.url) {
+      $('qimg').src = '/api/quark/qr.png?ts=' + Date.now();
+      $('qimg').hidden = false;
+      $('qbtn').textContent = '重新扫码';
+      quarkPoll();
+    } else if (j.phase === 'done') {
+      $('qmsg').innerHTML = '✅ 已登录（' + (j.done || '') + '）';
+    } else if (j.phase === 'failed') {
+      $('qmsg').innerHTML = '❌ 上次失败：' + esc(j.err || '');
+    }
+  } catch (e) { /* 首次加载忽略 */ }
+})();
+
+async function tick() {
+  try {
+    const r = await fetch('/api/state');
+    if (r.status === 403) {
+      $('banner').style.display = 'block';
+      $('banner').textContent = '会话已失效：请使用日志里的一次性链接重新打开（重启进程会更换令牌）。';
+      return;
+    }
+    if (!r.ok) { throw new Error('HTTP ' + r.status); }
+    $('banner').style.display = 'none';
+    render(await r.json());
+    loadConflicts();
+  } catch (e) {
+    $('sub').textContent = '刷新失败：' + e;
+  }
+}
+tick();
+setInterval(tick, 2000);
+</script>
+</body>
+</html>

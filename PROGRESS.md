@@ -1,6 +1,6 @@
 # Onerclone —— 需求与进度记录
 
-> 更新时间：2026-09-25 · 状态：**Phase 1（MVP）核心完成**：三库状态库 + 双向同步引擎 + 集成测试 A–E 全过；剩余夸克真实接入（DR4 扫码）
+> 更新时间：2026-09-27 · 状态：**Phase 1 完成**；**Phase 2 完成**（面板只读 + 管理动作 + 冲突可视化 + 托盘 + 开机自启）；**成品已交付**：`dist\onerclone-setup-0.2.0.exe`（24.2MB，无 UAC 安装）+ `dist\onerclone-v0.2.0-win64.zip`（31.5MB）；Phase 3 剩余：双机实测、10 万文件性能压测、Office 离线弹窗
 
 ---
 
@@ -238,9 +238,9 @@ cd D:\0Code\Onerclone
 ## 8. 后续 Phase 划分
 
 - **Phase 0（Spike）**：✅ 完成（全链路 + 开放事实 + 图标验收，见 §6）
-- **Phase 1（MVP）**：**核心完成（2026-09-25）**，详见 §9；剩余：夸克真实 remote 接入（DR4 扫码登录）、rcd 断线自动重启、离线弹窗肉眼验收
-- **Phase 2**：托盘 + Web 面板（队列/冲突/扫码/脱水管理）、冲突副本可视化
-- **Phase 3**：打包（Inno）、开机自启、双机实测、10 万文件性能压测
+- **Phase 1（MVP）**：**完成（2026-09-25）**，详见 §9；DR4 扫码/下载/上传/删除回路、rcd 断线自动重启、Q6 主动重拉、0x80070057 修复均已真机验证；仅剩**离线弹窗肉眼验收**（程序侧 5ms 快速失败已验证）
+- **Phase 2**：托盘 + Web 面板（队列/冲突/扫码/脱水管理）、冲突副本可视化 —— ✅ **全部完成（2026-09-27）**
+- **Phase 3**：打包（Inno）、开机自启、双机实测、10 万文件性能压测 —— 打包 ✅（zip + Inno 安装包）、开机自启 ✅（`onerclone autostart`，HKCU 无 UAC）；**剩余：双机实测、10 万文件性能压测、Office 离线弹窗肉眼验收**
 
 ## 9. Phase 1 进度（2026-09-25）
 
@@ -268,15 +268,77 @@ cd D:\0Code\Onerclone
 9. **execDownload 快照对齐 bug**：local_snap 写云端 mtime → 占位符实际 mtime 不同 → 下轮 Scan 误判"本地改"→ 回环上传+多余水合。**local_snap=本地实际 stat，cloud_snap=云端观测**，各归各。
 10. **交错 replace_string_in_file 会产出残缺结构**（两次局部替换撞车 → 混入残缺注释 + 花括号错位，编译错误行号还滞后于根因）。诊断：gofmt 首错在 func 行 = 前文函数体未闭合；用 `go/parser` + 深度状态机（跳过字符串/注释）定位。修复后必须跑全量测试。
 11. **单侧动作与删除互斥的边缘**：pending upload 会挡住 delete_local（localChanged=true 走复活分支）——语义=Q18 宁复活，可接受；测试需先 drain 首轮动作再断言删除。
-12. **旧 spike 进程占连接**：CF 同步根同时只能一个 provider 连接（0x8007017A "already connected"）；重启测试前必须 `Stop-Process -Name spike`。
+12. **旧 spike 进程占连接**：CF 同步根同时只能一个 provider 连接（0x8007017A "already connected"）；重启测试前必须 `Stop-Process -Name spike`（+ 杀残留 rclone rcd）。
+13. **切 remote 必须换 state.db**：`cloud_snap` 是“上次在哪个后端看到什么”的真相，换 `-fs`（本地替身）→ `-remote quark:` 后旧快照里的条目在新后端不存在 → 被判“云端已删”→ **误删本地文件**。真实 remote 验证要用隔离同步根（`-root ...dr4\sync`，state 路径 = `filepath.Dir(root)\OnercloneSpike.state`）。
+14. **quark 二维码在 TTY 下不打印**：`v1.70.0-quark` 的 `config create` 交互路径实测零输出（重定向 0 字节、屏幕缓冲区也无写入）；二维码只存在于 `--non-interactive` 输出 JSON 的 `Option.Help`（提示语 + ANSI 二维码 + 备用链接）。修复见 `cmd/spike/quark.go` + `cmd/spike/console_windows.go`（开 VT100）。
+15. **FILETIME 偏移少一个 0（0x80070057 真因）**：`cfapi.toFiletime` 写成 `11644473600000000`（应为 `116444736000000000` = 11644473600s × 1e7）→ 时间整体偏 116 年，且 **1960 年以前的 mtime 算出负 FILETIME** → `CfCreatePlaceholders` 判 ERROR_INVALID_PARAMETER → 该文件永远建不出占位符、被归 network 类无限退避重试（实测样本 `spike-remote\big.bin`，磁盘 mtime 真是 1694-08-19）。修：秒级换算 + 两端饱和 + 不能用 `UnixNano()`（仅 1678~2262 有定义）。取证手法：隔离参数的 `CfCreatePlaceholders` 探针（`size=-1`、`mtime=1694` 必现；零值/epoch/1602 正常）+ 单测 `internal/cfapi/filetime_test.go`。
+16. **rclone 在 Windows 对文件名做 Unicode 归一化 → “全角替换”方案不可用**：磁盘目录 `来自：分享`（U+FF1A），Go `os.ReadDir` 看到全宽，但 rclone `lsf`/`stat` 只报、只认 ASCII `来自:分享`（U+003A），且 `--no-unicode-normalization` **无效**（实测开/关结果相同）→ `operations/copyfile` 报 `object not found`（**Go 与 rclone 互认不了对方的路径写法**）。修：namemap 改为**纯 ASCII `%XX` 转义**（meta key 升到 `local_name_map_v2`，旧全宽映射表自动作废），并对任何 NFKC 会改动的字符（全角字母数字/标点、表意空格…）一并转义，保证两边字面一致。
+17. **实例运行时删同步根 = 把删除传播到云端**：为重置测试根，在 `spike run` 进程还活着时 `Remove-Item` 了 dr4 同步根 → watcher 把整根删除转成 delete_cloud → **用户夸克网盘里的 `心流_...Notebook.html`（32991B）被同步删除**（`来自:分享/` 目录因 `is a directory not a file` 幸免）。规矩：**先停实例（Enter 或杀进程）→ 再动同步根**；恢复依赖夸克回收站（已确认不用恢复）。
+18. **面板扫码会反过来吃掉你的 cookie（已修）**：`rclone config create` 会**重建整个 remote 段** → 已有 cookie 被清；而 `rclone config show` 又把 cookie 掩码成 `*** ENCRYPTED ***` → 用它取值再 update 等于写入垃圾。修法：**直接读写原始 `rclone.conf`**（`rclone config file` 拿路径，自解析 INI，创建前快照 [quark] 段、创建后/失败时把丢失的键原样写回）。验收：扫码会话前后 cookie **2162 字节完全一致**；失败路径由 `restore()` 再补一次。
 
 ### ⬜ Phase 1 剩余
 
-- [ ] **夸克真实 remote（DR4）**：代码层完成（`spike quark-login` + `run -remote quark:`），**待用户真 TTY 扫码**
-  - 取证结论：QR 状态机入口 = `rclone config create quark quark`（非 reconnect——quark 非 OAuth，实测 "backend doesn't support reconnect"）；流程第一步（网络建 `config_qr_session`）已验证落盘；survey 终端 UI **必须真 TTY**（管道下静默挂起），自动化环境无法完成扫码
+- [x] ~~**夸克真实 remote（DR4）**~~ → **✅ 2026-09-25 真机验证通过**
+  - 扫码：`spike quark-login` 重写为 `--non-interactive` 协议（解析 JSON 拿 `Option.Help` → spike 自己打印二维码 + 备用链接 → `--continue --state qr_poll --result true` 让 rclone 轮询到扫码完成），新增 `console_windows.go` 开 VT100（否则 ANSI 二维码退化成空白）、`-tries` 超时自动重出二维码。实测：扫码成功 → cookie（2171B）写入 rclone.conf → `lsd quark:` ✓
+  - 同步：`run -root C:\Users\Jw\OnercloneSpike.dr4\sync -remote quark:` 基线入队，真实网盘文件下载落地 ✓、占位符/水合链路在真实 remote 上工作 ✓；**上传/删除回路亦已真机验证**（本地 `来自%3A分享/dr4-uplink-verify.txt` → `📁 云端建目录 来自:分享` → `⬆ 上传完成` → 本地删 → `🗑 云端已删`，云端目录名与云端原名逐字一致）
+  - ⚠️ 事故记录：重置测试根时误删了云端 `心流_...Notebook.html`（见踩坑 #17），待从夸克回收站恢复
   - cookie 过期 → 引擎 auth 分类停队列 + 日志提醒重扫码 ✓（引擎侧完成）
-  - rclone.conf 已有 `[quark]` 骨架 + QR session；`spike quark-login` 走 delete+create 全新扫码
+- [x] ~~**云端非法字符命名策略（DR4 新发现）**~~ → **✅ 2026-09-25 方案 A 已实现并真机验证**
+  - 问题：quark 目录名可以含 `:`（如 `来自:分享`），Windows 建不出来 → `localFS.ApplyDownload` 的 `MkdirAll` 报 "The directory name is invalid"，引擎按 network 类无限退避重试
+  - 实现（`cmd/spike/namemap.go`）：段级**纯 ASCII `%XX` 转义**（`<>:"|?*`、控制字符、尾部空格点→`%20/%2E`、保留设备名→`%5F`前缀、**以及任何 NFKC 会改动的字符**如全角标点字母）；映射表持久化在 state.db meta `local_name_map_v2`（v1=全宽方案已作废，见踩坑 #16）；转义是单射（含 `%` 的段必被转义），另保留 `~<hash6>` 兜底；表只存改名项，十万文件不膨胀
+  - 接线：`localFS.path()`（Stat/ApplyDownload/Remove/FinalizeUpload/WasHydrated）、`localFS.Scan` 反向还原、`cloudRC.Upload/Download/DownloadTo` 本地侧、`populate` 占位符名、`app.rel`（水合取数按云端名）—— **engine 的 path 键永远是云端原名**，快照/队列/冲突逻辑零改动
+  - 验证：单测（净化规则/单射性、双向映射、重启持久化、损坏恢复、nil 直通、localFS.Scan 反向、ApplyDownload 落地）全绿 + 真机：`来自:分享` 落地为本地 `来自%3A分享` ✓、Scan 反向还原无伪回传 ✓、**上传/删除回路通过** ✓
 - [x] ~~rcd 断线自动重启（FR5 完整闭环）~~ → **✅ 2026-09-25 实测**：杀 rclone → 5s 首档退避自动重启（5→10→20→30s 封顶无限重试）→ `atomic.Pointer` client 热替换（引擎/水合无感知）→ 杀后入队的上传在恢复后成功落到云端。证据见 `cloudRC.SetClient` + run 内监控循环
-- [ ] 离线模式（`-offline`）肉眼验收（P0 遗留）
-- [ ] Q6 完整语义：曾水合文件云端变更后**主动**重拉数据（现在是懒水合：删旧重建占位符，读时拉最新——内容正确但离线窗口内不可读）
-- [ ] `sub` 目录占位符预热 0x80070057（INVALID_PARAMETER）待查——目录转占位符的参数问题，引擎的 download 建目录路径未受影响
+- [x] ~~离线模式（`-offline`）肉眼验收（P0 遗留）~~ → **程序侧已验证（2026-09-25）**：`READY [离线（-offline：水合立即失败）]`；未水合占位符 `big.bin` 读取 **5ms** 内失败并日志 `⊘ [offline] 读取 big.bin [0,+8388608) → 立即返回 NETWORK_UNAVAILABLE`；已水合文件（hello.txt）离线直接可读 ✓。**肉眼验收已做（2026-09-27，用户实测）**：VS Code 打开占位符报 `Unable to read file '...big.bin' (Unknown (FileSystemError): An unknown error occurred. Please consult the log for more details.)` —— 应用层拿到明确错误、5ms 快失败、不卡死不崩，同时日志出现 `⊘ [offline] 读取 ...`。（注意：必须开**正在运行的那个根**，跨根打开不会触发弹窗；记事本/Office 未测，留 Phase 3 收尾）
+- [x] ~~Q6 完整语义：曾水合文件云端变更后**主动**重拉数据~~ → **✅ 2026-09-25 实现 + 真机验证**：`engine.Local` 新增 `Hydrate(rel)`（`localFS` 实现：读一遍占位符触发 FETCH_DATA → rclone RangeGet → 回填 → `SetInSync`），`execDownload` 对"曾水合"文件在建完占位符后立即重拉（日志 `🔄 Q6 主动重拉完成 xxx（已就地可读）`），失败只降级为读时懒水合、不判动作失败；新文件仍只建占位符（不白拉流量）。单测 `TestQ6RereadsPreviouslyHydratedFile`（首轮不重拉 / 云端变更后恰重拉 1 次）；真机：改云端 `hello.txt` → `💧 水合` + `🔄 Q6 主动重拉完成`，下载窗口结束即可离线读
+- [x] ~~`sub` 目录占位符预热 0x80070057（INVALID_PARAMETER）待查~~ → **✅ 已修（根因不是 sub，是 FILETIME）**：见踩坑 #15。复验：`✅ 占位符就绪: 5 个文件`（含 8MB `big.bin`）无任何报错，引擎重试也消失
+
+---
+
+## 10. Phase 2 进度（2026-09-27）
+
+### ✅ 第 1 片：本地 Web 面板（只读）—— Q8/Q14
+
+| 部件 | 内容 |
+|---|---|
+| `internal/state` | 新增 `ListActions(states, limit)`：只读列举队列（默认除 done 外、按 updated 倒序、上限 200），不动状态 |
+| `cmd/spike/panel.go` | 127.0.0.1 随机端口；**一次性 token**（`?t=` 换会话 Cookie 后立即作废，日志里那行链接只能点一次）；Cookie `HttpOnly + SameSite=Strict`；`GET /` 出单页、`GET /api/state` 出 JSON（status + actions）；**只读**，无任何改状态的接口 |
+| `cmd/spike/ui/index.html` | `go:embed` 单页：暗色卡片（基线/待执行/永久失败/认证失败/已完成/时长）+ 队列表格（类型/状态/重试/下次/错误），2s 轮询，403 自提示 |
+| 接线 | `cmdRun` 在打开状态库后启动面板并打印一次性链接，`defer` 关闭；面板失败不影响同步 |
+| 验证 | 单测 `panel_test.go`（token 一次性、Cookie 会话、伪造 Cookie 403、API JSON 形状与队列内容）✓；真机：浏览器打开一次性链接 → 302 发 Cookie → 页面正常渲染 + `/api/state` 轮询 ✓ |
+
+### ✅ 第 1.5 片：成品化与打包（2026-09-27）—— 要的「exe 成品」**
+
+| 部件 | 内容 |
+|---|---|
+| 配置 | 新增 `cmd/spike/config.go`：exe 同目录 `onerclone.json`（首次运行自动生成模板；不可写则退回用户配置目录）；**三级优先级 flag > 配置 > 内置默认**；**容忍 UTF-8 BOM**（Notepad/PS5.1 保存常见，Go 的 json 不认）；默认 `remote: "quark:"` |
+| rclone 自动发现 | `resolveRclone`：flag → 配置 → **exe 同目录 `rclone.exe`** → PATH → 兜底路径（发布包把 rclone 放 exe 旁即可开箱） |
+| 启动行为 | **无参数即开始同步**（`onerclone.exe` 双击可用）；`version`/`help` 为信息命令（不落日志、不读配置，避免污染发布目录） |
+| 首启健壮性 | 首轮 Poll 失败（多为未扫码/cookie 过期）**不再 Fatal**：DR2 保护仍生效 + 日志提示先跑 `onerclone quark-login`，后续轮询自动补基线 |
+| 控制台 | 启动即 `SetConsoleOutputCP/SetConsoleCP(65001)`：Go 输出 UTF-8，传统 conhost（936）会把中文日志渲染成乱码（实测 help 输出字节本身合法，纯显示问题） |
+| 日志 | 固定写 **exe 同目录 `onerclone.log`**（原 `spike.log` 相对路径会跟着 CWD 跑偏） |
+| 版本 | `main.version/main.buildDate` 由 ldflags 注入；`onerclone version` → `onerclone v0.2.0 (build 2026-09-27)` |
+| 打包 | `build.ps1`（测试 → 构建 → 组装 → 自检 → zip，**需 UTF-8 BOM**，否则 PS5.1 按 GBK 解析脚本会报语法错）→ `dist\onerclone-v0.2.0-win64\`（onerclone.exe 11.5MB + rclone.exe 77.6MB + README + VERSION）与 **`dist\onerclone-v0.2.0-win64.zip`（31.5MB）**；`dist/`、`onerclone.log`、`onerclone.json` 已入 `.gitignore` |
+| 文档 | 新增根 `README.md`（环境要求/快速开始/配置表/命令/行为说明/构建/已知边界），打包时复制进发布目录 |
+| 冒烟测试 | ① **本地模式**（BOM 配置、零云端）：版本/配置读取/rclone 自动发现/示例数据/基线 4 项/占位符/面板 token 一次性(403)+Cookie+API JSON/云端改动 kick → `⬇ 下载完成` 全通；② **真实 quark 只读**：`来自:分享` 落地为本地 `来自%3A分享`（%3A 转义 ✓）、网盘零写入；③ 冒烟同步根已 unregister + 临时目录已删 |
+
+### ✅ 第 2 片：面板管理动作 + 冲突可视化（2026-09-27）
+
+| 部件 | 内容 |
+|---|---|
+| `state` | 新增 `Retry(id)`（回 pending、清尝试/错误）、`Drop(id)`（删行） |
+| `engine` | 新增 `KindDehydrate` 动作 + `execDehydrate`（复用 download 落地路径但**禁用 Q6 重拉**，否则刚释放的空间又被拉回）+ 面板 API：`RequestDehydrate`（未水合返回 false→面板 409）、`IsHydrated`、`RetryAction`、`DropAction` |
+| 面板端点 | `POST /api/action/retry` `POST /api/action/drop` `POST /api/dehydrate` `GET /api/conflicts` `POST /api/quark/start` `GET /api/quark/status` `GET /api/quark/qr.png`（全部走同一 Cookie 鉴权） |
+| 扫码登录 | 复用 CLI 的 `--non-interactive` 协议，后台跑 `--continue` 轮询；`go-qrcode` 服务端出 PNG（320px）；页面轮询 status 直到 done/failed |
+| 冲突可视化 | 读 `local_snap/cloud_snap` + `conflict` 动作，展示两端大小/时间与 `xxx (冲突 时间).ext` 副本（双侧） |
+| UI | 队列表格行内**重试/放弃/脱水**按钮、冲突区、扫码卡片（刷新时自动恢复进行中的会话） |
+| 验证 | 单测：`TestPanelActionEndpoints`（重试回 pending、放弃消失、未水合 409、水合后入队 dehydrate）+ `TestPanelConflicts`（两端快照与副本识别）✓；真机：QR PNG 1156B 魔数 `89-50-4E-47`、`🫙 已脱水 hello.txt` 日志 ✓ |
+
+### ✅ 第 3 片：托盘 + 开机自启 + 安装包（2026-09-27）
+
+| 部件 | 内容 |
+|---|---|
+| 托盘 | `cmd/spike/tray.go`（`getlantern/systray`）：菜单 = 打开面板（读全局一次性链接）/ 打开同步根 / 打开日志 / 退出（走 `trayQuit`，与 Ctrl+C 同一条退出路径）；图标 `cmd/spike/ui/tray.ico` 由一次性生成器产出（32×32 32bit 云朵，BGRA+AND 手写 ICO 容器）；启动 panic 只记日志不影响同步 |
+| 开机自启 | `onerclone autostart`（`-enable/-disable`/查询）→ HKCU `…\CurrentVersion\Run`，**普通用户无 UAC**；安装包按任务自动调用，卸载时自动关闭 |
+| 安装包 | `installer.iss`（Inno 6：`PrivilegesRequired=lowest` 装到 `{localappdata}\Onerclone`、任务=桌面图标/开机自启/装完启动、卸载时关自启+注销同步根+清日志/状态）；`build.ps1 -Installer` 自动找 ISCC；本机用 `winget install JRSoftware.InnoSetup --scope user` 装了 6.7.3 |
+| 验证 | 静默安装（`/VERYSILENT`）→ 文件齐全 → `onerclone version` ✓ → 安装任务写入的自启注册表值正确 ✓ → `autostart -disable` 关闭 ✓；真机联调：托盘启动日志 `📌 托盘已启动`、面板全端点 200、**cookie 前后 2162 字节完全一致**（见踩坑 #18）✓ |
