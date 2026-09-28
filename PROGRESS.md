@@ -342,3 +342,73 @@ cd D:\0Code\Onerclone
 | 开机自启 | `onerclone autostart`（`-enable/-disable`/查询）→ HKCU `…\CurrentVersion\Run`，**普通用户无 UAC**；安装包按任务自动调用，卸载时自动关闭 |
 | 安装包 | `installer.iss`（Inno 6：`PrivilegesRequired=lowest` 装到 `{localappdata}\Onerclone`、任务=桌面图标/开机自启/装完启动、卸载时关自启+注销同步根+清日志/状态）；`build.ps1 -Installer` 自动找 ISCC；本机用 `winget install JRSoftware.InnoSetup --scope user` 装了 6.7.3 |
 | 验证 | 静默安装（`/VERYSILENT`）→ 文件齐全 → `onerclone version` ✓ → 安装任务写入的自启注册表值正确 ✓ → `autostart -disable` 关闭 ✓；真机联调：托盘启动日志 `📌 托盘已启动`、面板全端点 200、**cookie 前后 2162 字节完全一致**（见踩坑 #18）✓ |
+
+---
+
+## 11. 用户实测反馈（v0.2.0 成品，2026-09-28）→ Phase 4 待办
+
+> 背景：用户在新设备跑了 `dist\onerclone-setup-0.2.0.exe` 安装的成品，提出 3 个问题。
+> 本轮已完成**代码调研 + rclone 协议实测**，方案已定但**代码尚未实施**——换设备续作时从这里接。
+
+### 问题 ① Explorer 状态图标（云朵/对勾）不显示
+
+**现象**：文件系统层占位符正常（水合/同步功能完好），但资源管理器里没有同步状态图标。
+
+**本机取证结果（2026-09-28）**：
+- `HKLM\...\Explorer\SyncRootManager` 下**只有 OneDrive 的键，没有任何 Onerclone 键** → 说明用户跑 dist 成品时 Shell 注册层从未成功写入（或被清掉）
+- `shellreg.go` 的注册逻辑只在 `onerclone register` 命令里调用；`cmdRun`（双击 exe 直接跑）只调 `CfRegisterSyncRoot`（内核层）+ `RegisterFlagUpdate`，**从不写 SyncRootManager 注册表** → 这就是图标消失的直接原因
+- dist 发布目录里也没有 `onerclone.log`（用户机器上跑的），无法确认当时是否报过 `⚠ Shell 注册失败`
+
+**修复方案（已定，未写码）**：
+1. `cmdRun` 启动时**自动补 Shell 注册**：调 `shellRegister(root)`，失败只记日志不 Fatal（与 register 命令同款容错）
+2. 顺带排查 `shellRegister` 的两个潜在坑：
+   - `registry.CreateKey(LOCAL_MACHINE, …)` 在某些机器上普通用户可能无权限写 HKLM（本机实测可写，但用户机器未知）→ 失败时降级写 `HKCU\...\SyncRootManager`（OneDrive 也用 HKCU 层，Explorer 两层都认）
+   - `Flags=0x162` 与 `IconResource=imageres.dll,-1043` 照抄 OneDrive，若仍不显示再试 `Flags` 加 `PreventPinnedToDesktop` 等位
+3. 验收：注册表键出现 + 重启 Explorer（或注销重登）后云朵/对勾显示
+
+### 问题 ② 同步根可自定义（不想放 C 盘用户目录）
+
+**现状**：`sync_root` 已支持 `onerclone.json` 配置 + `-root` flag，但改路径有两个坑：
+- **state.db 路径跟着同步根走**（`main.go` 里写死 `filepath.Dir(syncRoot)\OnercloneSpike.state`）→ 换根后旧队列/基线全部丢失，且旧根目录残留状态库
+- 换根后旧同步根的 cfapi 注册还在（内核层 + Shell 层都残留）→ Explorer 里旧目录仍显示云图标
+
+**修复方案（已定，未写码）**：
+1. **state.db 固定放 exe 同目录**（或 `%LocalAppData%\Onerclone`），与同步根解耦——换根不丢队列/基线/namemap
+2. 面板加「设置」区：改 `sync_root`（选目录）+ 改 `remote`（下拉已有 remote）→ 写回 `onerclone.json` → 提示"重启生效"；顺带显示当前配置
+3. `cmdRun` 启动时检测：配置的根 ≠ 当前注册的根 → 自动 unregister 旧根 + register 新根（或提示用户跑 `onerclone register -root 新根`）
+4. 注意踩坑 #13：**换根不等于换 remote**，但如果同时换了 remote，state.db 里的 cloud_snap 必须作废（加 `remote` 指纹到 meta，变更即清空 cloud_snap + 重建基线）
+
+### 问题 ③ 开放任意 rclone 后端（不只夸克）
+
+**用户原话**：需要开放别人夸克扫码**或者别的 rclone 登录方式**，相当于做了一个 Windows 资源管理器同步显示（cfapi）+ 增删查改的工具，上传下载存储还是依赖 rclone，**适配所有 rclone 的存储 config**。
+
+**rclone 非交互协议实测（2026-09-28，本机 v1.70.0-quark）**——这是本问题最重要的调研成果：
+- `rclone config providers` 返回全部后端 JSON（本机 80+ 个：dropbox/onedrive/drive/s3/webdav/ftp/sftp/mega/quark/…）
+- `rclone config create <name> <type> --non-interactive` 是**通用状态机**，逐题吐 JSON（State/Option.Name/Option.Help/Required/Examples），答 `--continue --state <State> --result <值>` 推进：
+  - **OAuth 后端（dropbox 实测）**：首问 `*oauth-islocal`（本机有无浏览器）→ 答 `true` 后 rclone **自己开浏览器等本地回调**（面板场景完美）；答 `false` 则进 `*oauth-authorize` 状态，Help 里给出指引（`rclone authorize "dropbox"` + 粘贴结果），面板可渲染成输入框
+  - **扫码后端（quark）**：qr_start/qr_poll（已实现，见 quark.go）
+  - **无必填项后端（local/ftp 实测）**：直接落盘，返回 `State:""`（完成态判定 = State 为空）
+- ⚠️ `config create` 会重建整个 remote 段（踩坑 #18 的 cookie 丢失问题对 OAuth token 同样适用）→ 通用登录必须沿用 quark.go 的「原始 rclone.conf 快照 + 恢复」套路
+
+**修复方案（已定，未写码）**：
+1. 新增 `onerclone login`（CLI）+ 面板「添加远程存储」卡片：
+   - `GET /api/remotes`（列 `rclone listremotes` + 各自 type）+ `GET /api/providers`（列后端类型）
+   - `POST /api/login/start` `{name, type}` → 驱动非交互状态机：普通必填题渲染成表单、OAuth islocal=true 直接让 rclone 开浏览器、扫码题渲染二维码（复用现有 quark 渲染）、`*oauth-authorize` 渲染"粘贴 token"输入框
+   - `POST /api/login/answer` `{state, result}` 推进状态机直到 `State:""`
+   - 全程套用 conf 快照/恢复保护旧凭据
+2. `onerclone.json` 的 `remote` 字段本就是任意 rclone remote 语法（`dropbox:`、`onedrive:path/sub` 都合法）→ 引擎侧零改动；`classify` 的 auth 关键字已覆盖 OAuth 过期（401/403/token expired）
+3. 面板「设置」区加 remote 下拉（问题 ② 的设置区顺带做）
+4. 文档：README 补「支持任意 rclone 后端」说明 + 各后端登录方式差异表
+
+### Phase 4 实施顺序建议
+
+1. 问题 ①（最小：`cmdRun` 补 `shellRegister`，几行代码，先让图标回来）
+2. 问题 ②（state.db 解耦 + 面板设置区）
+3. 问题 ③（通用登录状态机，工作量最大；② 的设置区先落地，③ 复用其 remote 下拉）
+4. 全部完成后 `build.ps1 -Version 0.3.0 -Installer` 出新包，真机验收三项
+
+### 本轮对话存档
+
+- 本文件 §11 即上轮对话的完整结论存档（换设备后从 §11 的「修复方案」接续实施即可）
+- 代码现状：`main` @ `0897ba0`（Phase 2 complete），工作区干净，已推 GitHub
+- 本机环境（2026-09-28）：Go `D:\Software\go\bin\go.exe`（v1.27.1）、rclone `D:\Software\rclone\rclone.exe`（v1.70.0-quark）、仓库 `D:\0Code\Onerclone`、Inno Setup 6.7.3（user scope）
