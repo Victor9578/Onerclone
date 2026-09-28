@@ -133,6 +133,53 @@ func (m *nameMap) cloudPath(localRel string) string {
 	return strings.Join(segs, "/")
 }
 
+// ensureUploadable 保证"本地新建文件的字面名"能被 rclone 读到（踩坑 #16/#23）：
+// 用户拷进来的名字可能含 NFKC 不稳定字符（全角 `：`、`Ａ` 等）——磁盘上是
+// 全角，rclone 在 Windows 上只认 ASCII 形 → copyfile 404。这里把这类段
+// **改名**成转义形式并登记映射（云端名 = 转义名），随后上传两侧字面一致。
+// 返回值 = 该文件上传时应使用的**云端名**（可能已改名）。
+// 干净段原样返回（不登记，表不膨胀）。
+func (m *nameMap) ensureUploadable(localRel string) string {
+	if m == nil {
+		return localRel
+	}
+	segs := strings.Split(localRel, "/")
+	for i, s := range segs {
+		// 先查映射：已登记的名字（含转义产物）直接用登记结果，
+		// 不得再走 sanitize（isCleanSeg 对含 % 的段判"不干净"会二次转义）
+		m.mu.RLock()
+		c, mapped := m.toCld[s]
+		m.mu.RUnlock()
+		if mapped {
+			segs[i] = c
+			continue
+		}
+		if isCleanSeg(s) {
+			continue // 干净段不动
+		}
+		// 不干净：本地字面名 → 转义名（作为云端名），登记双向映射
+		esc := sanitizeSeg(s)
+		if esc == s {
+			continue // sanitize 后没变（理论上 isCleanSeg 已覆盖，防御）
+		}
+		m.mu.Lock()
+		// 碰撞防护：转义名已被别的段占用 → freeName 兜底
+		if owner, taken := m.toCld[esc]; taken && owner != s {
+			esc = m.freeName(s)
+		} else if m.cloud[esc] && esc != s {
+			// 云端已有同名字面段（罕见）→ 也走兜底
+			esc = m.freeName(s)
+		}
+		m.toLoc[esc] = s // 云端名(转义) → 本地名(原字面)
+		m.toCld[s] = esc // 本地名(原字面) → 云端名(转义)
+		m.dirty = true
+		m.saveLocked()
+		m.mu.Unlock()
+		segs[i] = esc
+	}
+	return strings.Join(segs, "/")
+}
+
 // localSeg 单段映射（懒登记）。
 func (m *nameMap) localSeg(cloudSeg string) string {
 	m.mu.RLock()

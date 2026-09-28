@@ -26,6 +26,7 @@ func (stubCloud) Upload(string) error                       { return nil }
 func (stubCloud) Download(string) error                     { return nil }
 func (stubCloud) DownloadTo(string, string) error           { return nil }
 func (stubCloud) Delete(string) error                       { return nil }
+func (stubCloud) Purge(string) error                       { return nil }
 func (stubCloud) Mkdir(string) error                        { return nil }
 
 type stubLocal struct{ hydrated map[string]bool }

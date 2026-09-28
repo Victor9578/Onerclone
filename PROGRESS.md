@@ -464,6 +464,49 @@ cd D:\0Code\Onerclone
 - [ ] Office 离线弹窗肉眼验收（Phase 3 遗留）
 - [ ] 双机实测、10 万文件压测（Phase 3 遗留）
 
+---
+
+## 13. v0.3.0 用户实测反馈（2026-09-28 下午）→ v0.3.1 修复
+
+> 用户在真机跑 v0.3.0（同步根 `D:\OnercloneSpike`，真实 quark remote），日志暴露 4 个 bug。
+> 本轮已全部修复 + 出 v0.3.1 包。
+
+### 问题与根因
+
+| # | 现象 | 根因 | 修复 |
+|---|---|---|---|
+| ① | **PDF 双击不水合，Acrobat 报"元数据错误"** | `populate`（P0 遗留的占位符预热）与引擎 `execDownload` **并发**建/删占位符：populate 先建好（in-sync），引擎 ApplyDownload 随即 `os.Remove`+重建，竞态下 reparse 元数据被破坏 → 文件属性位 `0x401620`（RECALL 位异常）vs 正常 `0x420`；cldflt 对该文件的一切操作（open/delete/rename）都报 `云文件元数据已损坏` | **删除 populate**（引擎已覆盖其职责）；坏文件处置见下 |
+| ② | **拷贝文件夹进来 7 个文件只有 1 个上传成功**（404） | 文件名含全角冒号 `：`（NFKC 不稳定字符）——namemap 只处理"云端→本地"方向，**用户本地新建**的这类名字不在映射表 → 上传时 rclone 找转义名 `%EF%BC%9A`，磁盘上是全角名 → 404（namemap.go 注释里自己标注的已知缺口） | 新增 `ensureUploadable`：Scan 发现不干净段当场登记映射（云端名=转义名，本地保持用户字面名），接进 `localFS.Scan` |
+| ③ | **`~$` Office 锁文件被上传**后报错 | watcher 侧过滤了 `~$`，但引擎 Scan 没有 → 锁文件入队上传 → 用户关闭文档时锁文件消失 → 上传 404 + 无谓删除传播 | engine 新增 `isTempPath`，`scanLocked` 双侧（快照+入队）过滤 |
+| ④ | **删目录传不到云端**："is a directory not a file" 无限重试 | `execDeleteCloud` 对目录用了 `operations/deletefile`（只删文件） | Cloud 接口加 `Purge`；目录删除走 `operations/purge`（递归） |
+
+### 坏占位符处置（踩坑 #24）
+
+- reparse 元数据损坏的文件**无法删除**：`Remove-Item`/`cmd del`/`DeleteFileW(\\?\)`/`MoveFileExW`/`fsutil reparsepoint delete` 全部报 `云文件元数据已损坏且不可读取`（cldflt 拦截）；**注销同步根也救不回来**（属性位仍 0x401620）
+- 已试过：`tmp_fixdel/` 工具（FSCTL_DELETE_REPARSE_POINT 剥 tag）——CreateFileW 本身就被拦
+- **可行方案（留给用户）**：① 重启后再删（cldflt 重载元数据）② `chkdsk D: /f`（文件系统级修复）③ 最后手段：把同步根目录整个删掉重建（引擎会从云端重新拉全部占位符）
+- 本机现状：`安康…工程勘察…(1).pdf`（1020620B）仍是坏文件，**建议重启后删除**；其余 11 个文件正常
+
+### 本轮踩坑（续编号）
+
+22. **populate 预热与引擎 download 并发建占位符 = reparse 元数据损坏**：两个写入者同时对同一文件 CreatePlaceholders/Remove，竞态产出坏占位符（属性位异常 + 一切操作被 cldflt 拒绝）。教训：**占位符的创建者必须唯一**（引擎是唯一真相源）。
+23. **namemap 只做"云端→本地"是不够的**：用户本地新建的 NFKC 不稳定名（全角`：`等）rclone 读不到 → 上传 404。`ensureUploadable` 补上"本地→云端"方向：Scan 时发现不干净段当场登记（云端名=转义名）。注意：与已登记云端名**同名**的磁盘文件是另一个文件——必须再转义一层（`%`→`%25`）拿独立名，否则 localPath 会解析到不存在的旧本地名。
+24. **坏占位符无法删除**：见上"坏占位符处置"。预防靠 #22（别再产生坏占位符）。
+25. **PS5.1 无 BOM 的 UTF-8 脚本按 GBK 解析**（build.ps1 同款坑）：临时 .ps1 脚本含中文/特殊字符时必须带 BOM，否则解析错误满屏；写一次性工具直接用 Go 更省事。
+
+### ✅ v0.3.1 包已出（2026-09-28）
+
+- `dist\onerclone-v0.3.1-win64.zip`（31.7MB，含 rclone 77.6MB ← `D:\Tools\onerclone\rclone.exe`）
+- 全量测试 + vet 绿；新增单测：`TestEnsureUploadable`（NFKC 名登记/同名再转义/干净名不动）
+- **注意**：`D:\Tools\rclone\rclone.exe` 已不存在（本机 rclone 现在部署目录 `D:\Tools\onerclone\`），build.ps1/resolveRclone 候选列表已加该路径
+
+### ⬜ v0.3.1 验收清单（用户侧）
+
+- [ ] 重启电脑 → 删除坏 PDF（`安康…工程勘察…(1).pdf`）→ 跑 v0.3.1 → 该文件应重新下载为正常占位符 → 双击可开
+- [ ] 拷贝含全角冒号文件名的文件夹进来 → 7 个文件应全部上传成功（不再 404）
+- [ ] 打开 Office 文档编辑 → `~$` 锁文件不应出现在队列/日志
+- [ ] 删除一个云端目录（如 `来自:分享`）→ 应真正删除（不再 "is a directory" 重试）
+
 ### 本轮对话存档
 
 - 本文件 §11 即上轮对话的完整结论存档（换设备后从 §11 的「修复方案」接续实施即可）

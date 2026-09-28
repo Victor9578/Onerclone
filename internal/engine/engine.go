@@ -51,6 +51,8 @@ type Cloud interface {
 	DownloadTo(src, dst string) error
 	// Delete 删云端单文件。
 	Delete(rel string) error
+	// Purge 递归删云端目录（目录删除必须走它，deletefile 对目录报错）。
+	Purge(rel string) error
 	// Mkdir 建云端目录（幂等）。
 	Mkdir(rel string) error
 }
@@ -99,6 +101,19 @@ func conflictName(rel string, now time.Time) string {
 	ext := path.Ext(rel)
 	stem := strings.TrimSuffix(rel, ext)
 	return fmt.Sprintf("%s (冲突 %s)%s", stem, now.Format("20060102-150405"), ext)
+}
+
+// isTempPath 判断是否是临时文件（FR4：不参与同步）。
+// `~$` 开头 = Office 锁文件；`.tmp` 结尾 = 常见编辑器临时文件。
+// watcher 侧已过滤，引擎 Scan 侧必须同样过滤——否则 Office 打开文档的
+// 锁文件会被入队上传，随后又被用户关闭删除 → 上传失败 + 无谓的删除传播
+//（v0.3.0 用户实测：`~$21_设计标2 .docx` 上传 404 刷屏）。
+func isTempPath(rel string) bool {
+	base := path.Base(rel)
+	if strings.HasPrefix(base, "~$") {
+		return true
+	}
+	return strings.HasSuffix(strings.ToLower(base), ".tmp")
 }
 
 func changed(snap state.FileSnap, e CloudEntry) bool {
@@ -159,6 +174,9 @@ func (e *Engine) scanLocked() (map[string]bool, int, error) {
 
 	nowMap := map[string]CloudEntry{}
 	for _, en := range entries {
+		if isTempPath(en.Path) {
+			continue // 临时文件（~$/.tmp）不进快照 → 永不触发上传/删除
+		}
 		nowMap[en.Path] = en
 	}
 
@@ -166,6 +184,9 @@ func (e *Engine) scanLocked() (map[string]bool, int, error) {
 	queued := 0
 	// 1) 新增 / 修改 → upload（conflict 由 exec 前复查或 Poll 抢占裁决）
 	for _, en := range entries {
+		if isTempPath(en.Path) {
+			continue
+		}
 		old, ok := snap[en.Path]
 		if ok && old.Present && !changed(old, en) {
 			continue // 未变
@@ -741,7 +762,18 @@ func (e *Engine) execDeleteCloud(rel string) (error, state.RetryClass) {
 			e.log.Printf("♻️ 删除前复查：云端 %s 已变 → 复活为 download（Q18）", rel)
 			return nil, state.ClassNetwork
 		}
-		if err := e.cloud.Delete(rel); err != nil {
+		// 目录必须 Purge（递归删）：deletefile 只删文件，对目录报
+		// "is a directory not a file" → 永久失败无限重试
+		//（v0.3.0 用户实测：删 `来自:分享` 目录卡死在重试）。
+		// ⚠ 快照里该目录的子条目会由下一轮 Poll 的"云端消失"分支清理，
+		// 不在这里逐条打墓碑（Delete 语义 = 整树删除）。
+		var err error
+		if ce.IsDir {
+			err = e.cloud.Purge(rel)
+		} else {
+			err = e.cloud.Delete(rel)
+		}
+		if err != nil {
 			return err, classify(err)
 		}
 	}

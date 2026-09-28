@@ -132,3 +132,46 @@ func TestNilMapIsPassthrough(t *testing.T) {
 	}
 	m.observeCloud("anything") // 不应 panic
 }
+
+// TestEnsureUploadable 本地新建的 NFKC 不稳定名（踩坑 #23）：
+// 用户拷进来的 `附件19：xxx.docx`（全角冒号）必须被当场登记——
+// 云端名换成转义形式，本地保持用户字面名，上传两侧字面一致。
+func TestEnsureUploadable(t *testing.T) {
+	m := newNameMap(nil)
+
+	// 不干净段：登记 + 返回转义名作为云端名
+	got := m.ensureUploadable("qmt/附件19：风控阈值.docx")
+	want := "qmt/附件19%EF%BC%9A风控阈值.docx"
+	if got != want {
+		t.Fatalf("ensureUploadable = %q, want %q", got, want)
+	}
+	// 双向映射已登记：本地字面名 ↔ 转义云端名
+	if back := m.cloudPath("qmt/附件19：风控阈值.docx"); back != want {
+		t.Fatalf("cloudPath(本地字面) = %q, want %q", back, want)
+	}
+	if lp := m.localPath(want); lp != "qmt/附件19：风控阈值.docx" {
+		t.Fatalf("localPath(转义云端名) = %q, want 本地字面名", lp)
+	}
+
+	// 干净名：原样返回、不登记
+	got2 := m.ensureUploadable("普通文件.txt")
+	if got2 != "普通文件.txt" {
+		t.Fatalf("干净名不应被改写: %q", got2)
+	}
+	if len(m.toLoc) != 1 {
+		t.Fatalf("映射表应只存 1 条改名项, got %d", len(m.toLoc))
+	}
+
+	// 磁盘上出现与已登记云端名**同名的文件**（如用户手动建了转义名文件）：
+	// 它是另一个文件——原样放行会让 localPath 解析到先前登记的本地名
+	//（磁盘上不存在 → 上传 404），还会跟云端已有文件撞车。正确行为：
+	// 再转义一层（% → %25）拿独立云端名，且新名能解析回磁盘字面名。
+	got3 := m.ensureUploadable(want)
+	want3 := "qmt/附件19%25EF%25BC%259A风控阈值.docx"
+	if got3 != want3 {
+		t.Fatalf("与已登记云端名同名 = 另一文件，应再转义拿独立名: %q, want %q", got3, want3)
+	}
+	if lp := m.localPath(got3); lp != want {
+		t.Fatalf("localPath(%q) = %q, 应解析回磁盘字面名 %q", got3, lp, want)
+	}
+}

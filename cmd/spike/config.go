@@ -202,6 +202,7 @@ func resolveRclone(flagVal, cfgVal string) string {
 	for _, p := range []string{
 		`D:\Tools\rclone\rclone.exe`,
 		`D:\Software\rclone\rclone.exe`,
+		`D:\Tools\onerclone\rclone.exe`,
 	} {
 		if fileExists(p) {
 			return p

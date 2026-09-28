@@ -4,6 +4,7 @@ import (
 	"io"
 	"log"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,6 +44,15 @@ func (f *fakeCloud) Download(rel string) error    { return nil }
 func (f *fakeCloud) DownloadTo(a, b string) error { return nil }
 func (f *fakeCloud) Delete(rel string) error {
 	delete(f.mu, rel)
+	return nil
+}
+func (f *fakeCloud) Purge(rel string) error {
+	// 目录递归删：删掉所有以 rel/ 开头的子条目
+	for p := range f.mu {
+		if p == rel || strings.HasPrefix(p, rel+"/") {
+			delete(f.mu, p)
+		}
+	}
 	return nil
 }
 func (f *fakeCloud) Mkdir(rel string) error { return nil }

@@ -498,14 +498,9 @@ func cmdRun(args []string) {
 	// 8) 分层轮询（Q15）：活跃 60s / 空闲 5min；每 12h 强制一次
 	go a.pollLoop()
 
-	// 9) 全量列举云端 → 创建占位符（首轮快速预热；之后由引擎 download 接管）
-	start := time.Now()
-	n, err := a.populate("", a.syncRoot)
-	if err != nil {
-		log.Printf("⚠ 占位符预热失败（不致命，引擎会补齐）: %v", err)
-	} else {
-		log.Printf("✅ 占位符就绪: %d 个文件，用时 %s", n, time.Since(start).Round(time.Millisecond))
-	}
+	// （P0 遗留的 populate 占位符预热已删除：引擎 download 已覆盖其职责，
+	// 两者并发建/删占位符会破坏 reparse 元数据 → "云文件元数据已损坏"，
+	// Acrobat 打不开。v0.3.0 用户实测踩坑 #22）
 
 	// 6) 监听本地改动（防抖 3s）
 	w, err := a.startWatcher()
@@ -635,57 +630,6 @@ func migrateSyncRoot(newRoot string) error {
 	}
 	_ = st.SetMeta("registered_root", newRoot)
 	return nil
-}
-
-// populate 递归列举远程目录并在本地创建占位符，返回文件数。
-func (a *app) populate(remoteRel, localDir string) (int, error) {
-	entries, err := a.rc.Load().List(a.fsRoot, remoteRel)
-	if err != nil {
-		return 0, fmt.Errorf("list %q: %w", remoteRel, err)
-	}
-	total := 0
-	var items []cfapi.NewPlaceholder
-	for _, e := range entries {
-		// 云端名 → 本地名（Windows 非法字符映射，与 localFS.ApplyDownload 同源）
-		lname := a.nm.localSeg(e.Name)
-		if e.IsDir {
-			sub := filepath.Join(localDir, lname)
-			if err := os.MkdirAll(sub, 0o755); err != nil {
-				return total, err
-			}
-			n, err := a.populate(e.Path, sub)
-			if err != nil {
-				return total, err
-			}
-			total += n
-			continue
-		}
-		items = append(items, cfapi.NewPlaceholder{
-			RelativeFileName: lname,
-			FileSize:         e.Size,
-			ModTime:          e.ModTime,
-			Flags:            cfapi.PlaceholderCreateFlagMarkInSync,
-			Identity:         []byte(e.Path), // e.Path = 相对云端根的路径，回调时可反查
-		})
-	}
-	if len(items) == 0 {
-		return total, nil
-	}
-	results, err := cfapi.CreatePlaceholders(localDir, items)
-	if err != nil {
-		// 平台会把首个失败码（如"已存在"）作为整体返回值，但条目仍被继续处理
-		if code, _ := cfapi.AsHRESULT(err); code != hrAlreadyExists {
-			return total, fmt.Errorf("create placeholders in %q: %w", localDir, err)
-		}
-	}
-	for i, hr := range results {
-		if hr == 0 || uint32(hr) == hrAlreadyExists {
-			total++
-			continue
-		}
-		log.Printf("⚠ 占位符创建失败 %s: HRESULT 0x%08X", items[i].RelativeFileName, uint32(hr))
-	}
-	return total, nil
 }
 
 // handleFetchData —— 水合核心：系统要读哪段，就从 rclone RC 取哪段回填。

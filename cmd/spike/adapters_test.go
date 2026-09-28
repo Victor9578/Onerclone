@@ -41,7 +41,10 @@ func TestLocalFSScanReverseMaps(t *testing.T) {
 		if e.Path == cloudRel {
 			found = true
 		}
-		if e.Path == localRel {
+		// ensureUploadable（踩坑 #23）会把"查不到映射的不干净段"当场登记：
+		// 转义名成为云端名。这里磁盘名已是登记过的映射产物（干净），
+		// 必须原样还原回云端原名，不得再转义一次。
+		if e.Path == "来自%3A分享/内部.txt" {
 			t.Fatalf("Scan 泄漏了本地名 %q，engine 键必须是云端原名", e.Path)
 		}
 	}

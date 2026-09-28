@@ -81,6 +81,12 @@ func (c *cloudRC) Delete(rel string) error {
 	return c.client().DeleteFile(c.dstFs, rel)
 }
 
+// Purge 递归删除云端目录（引擎目录删除用；deletefile 对目录报
+// "is a directory not a file"）。
+func (c *cloudRC) Purge(rel string) error {
+	return c.client().Purge(c.dstFs, rel)
+}
+
 func (c *cloudRC) Mkdir(rel string) error {
 	return c.client().Mkdir(c.dstFs, rel)
 }
@@ -111,8 +117,11 @@ func (l *localFS) Scan() ([]engine.CloudEntry, error) {
 			return nil
 		}
 		// 本地名 → 云端原名（映射表反向还原）：engine 的键永远是云端名，
-		// 这样云端 `来自:分享` 与本地 `来自：分享` 在快照/队列里是同一条
-		rel = l.nm.cloudPath(filepath.ToSlash(rel))
+		// 这样云端 `来自:分享` 与本地 `来自：分享` 在快照/队列里是同一条。
+		// 查不到映射 = 用户本地新建：名字若含 NFKC 不稳定字符（全角：等），
+		// rclone 读不到 → 上传 404（踩坑 #23）。这里当场登记映射：
+		// 云端名 = 转义名，本地保持用户字面名，两侧字面一致。
+		rel = l.nm.ensureUploadable(filepath.ToSlash(rel))
 		out = append(out, engine.CloudEntry{
 			Path:  rel,
 			Size:  info.Size(),
