@@ -598,6 +598,12 @@ func classify(err error) state.RetryClass {
 		strings.Contains(s, "directory not found"), strings.Contains(s, "no such file"),
 		strings.Contains(s, "not a file"):
 		return state.ClassPermanent
+	case strings.Contains(s, "cloud file metadata is corrupt"):
+		// 坏占位符（踩坑 #24）：cldflt 对该文件的一切访问（属性/删除/改名）
+		// 都返回 ERROR_CLOUD_FILE_METADATA_CORRUPT，当轮重试不可能成功 →
+		// 永久失败，面板可见原因（此前按 network 类每轮重试、日志刷屏）。
+		// 重启/手动删除修复后：面板重试，或删除文件后由下轮扫描补收敛。
+		return state.ClassPermanent
 	default:
 		return state.ClassNetwork
 	}

@@ -338,3 +338,45 @@ func trailingCut(s string) int {
 	}
 	return i
 }
+
+// markRenamed 物理文件已从 from 段改名到 to 段（to = 引擎键/云端名，%XX
+// 纯 ASCII 转义；见 adapters.go convergeNames，踩坑 #26）：
+//   - toLoc[to] = to、toCld[to] = to：把 to 登记成双向 identity ——
+//     localPath(to)=to（本地操作与 copyfile 源侧都走改名后的物理路径）,
+//     ensureUploadable(to)=to（含 % 的段查到 identity 就不会被二次转义成 %25）
+//   - toCld[from] = to 保留：用户若再拷入同名全角文件，仍会映射到 to 并再次改名
+func (m *nameMap) markRenamed(from, to string) {
+	if m == nil || from == to {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.toLoc[to] = to
+	m.toCld[to] = to
+	m.toCld[from] = to
+	m.dirty = true
+	m.saveLocked()
+}
+
+// rcloneBlindSeg 判断段名是否含 **rclone（Windows）读不到的字符**。
+//
+// 实测（2026-09-28，rclone v1.70.0-quark，踩坑 #26）：rclone 访问本地文件时
+// 会把「Windows 非法 ASCII 的全角形」先改写成 ASCII 再去打开 ——
+// `：`→`:`、`？`→`?`、`＜＜＞｜＊＼＂` 同理。磁盘上不可能存在 ASCII 形
+// （NTFS 非法，`:``?` 等），于是任何含这类字符的本地文件对 rclone **永远
+// object not found**，且没有任何等价路径写法可绕过（Go/资源管理器却读得到）。
+// 不在此列的全角字符（`（）`、`Ａ`、`／`、表意空格…）rclone 照常可读，不改名。
+// 判定规则：NFKC 后变成单个 `<>:"|?*\` 字符且自身 != 该 ASCII 字符。
+func rcloneBlindSeg(s string) bool {
+	const asciiIllegal = `<>:"|?*\`
+	for _, r := range s {
+		n := norm.NFKC.String(string(r))
+		if n == string(r) {
+			continue
+		}
+		if nr := []rune(n); len(nr) == 1 && strings.ContainsRune(asciiIllegal, nr[0]) {
+			return true
+		}
+	}
+	return false
+}

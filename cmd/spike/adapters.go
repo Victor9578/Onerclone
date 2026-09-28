@@ -7,14 +7,80 @@
 import (
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 
 	"onerclone/internal/cfapi"
 	"onerclone/internal/engine"
 	"onerclone/internal/rclone"
 )
+
+// convergeNames 把同步根下**物理名含 rclone 读不到字符**（全角 `：？＜＞` 等，
+// 踩坑 #26）的文件/目录改名成引擎键（= 云端名，%XX 纯 ASCII），并登记
+// identity 映射（markRenamed）。
+//
+// 为什么必须改名：copyfile 源侧只能给 rclone 一个路径，而这类名字对 rclone
+// 恒为 object not found（它会先把全角改写成 ASCII 再打开，NTFS 上不存在
+// ASCII 形），没有任何写法能绕过 —— 唯一出路是让磁盘名变成 rclone 读得到的
+// 转义名，两侧字面一致（踩坑 #16/#23 的最终闭环）。
+//
+// 目录自顶向下：父目录先改名，子路径整体位移后递归处理子项自身的段。
+// 改名失败（文件被占用/同名冲突）只告警：后续每轮 Scan 会自动重试，
+// 期间该文件上传按 404 → 永久失败在面板可见。
+func convergeNames(root string, nm *nameMap) {
+	if nm == nil {
+		return
+	}
+	var walk func(dir string)
+	walk = func(dir string) {
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			return // 被占用等瞬时错误：下轮扫描自愈
+		}
+		for _, e := range ents {
+			physSeg := e.Name()
+			// 临时文件不参与同步（engine.isTempPath 同款规则），也不改名
+			if strings.HasPrefix(physSeg, "~$") ||
+				strings.HasSuffix(strings.ToLower(physSeg), ".tmp") {
+				continue
+			}
+			abs := filepath.Join(dir, physSeg)
+			rel, err := filepath.Rel(root, abs)
+			if err != nil {
+				continue
+			}
+			// 引擎键（=云端名）：父段此时已收敛，engSeg 就是本段的映射结果
+			eng := nm.ensureUploadable(filepath.ToSlash(rel))
+			engSeg := eng
+			if i := strings.LastIndexByte(eng, '/'); i >= 0 {
+				engSeg = eng[i+1:]
+			}
+			isDir := e.IsDir()
+			if engSeg != physSeg && rcloneBlindSeg(physSeg) {
+				target := filepath.Join(dir, filepath.FromSlash(engSeg))
+				if _, err := os.Lstat(target); err == nil {
+					log.Printf("⚠ 改名冲突：目标已存在，跳过（该文件上传将失败）: %s", target)
+				} else if err := os.Rename(abs, target); err != nil {
+					log.Printf("⚠ 改名失败（rclone 读不了全角名，稍后重试） %s → %s: %v", physSeg, engSeg, err)
+				} else {
+					log.Printf("🏷 本地改名 %s → %s（rclone 在 Windows 读不了全角冒号等字符）", physSeg, engSeg)
+					nm.markRenamed(physSeg, engSeg)
+					abs = target
+					if st, err := os.Lstat(abs); err == nil {
+						isDir = st.IsDir()
+					}
+				}
+			}
+			if isDir {
+				walk(abs)
+			}
+		}
+	}
+	walk(root)
+}
 
 // ---------- Cloud锛歳clone RC ----------
 
@@ -102,6 +168,10 @@ type localFS struct {
 // Scan 鍏ㄩ噺鎵弿鍚屾鏍癸紙鍚崰浣嶇鈥斺€攐s.Stat 瀵瑰崰浣嶇杩斿洖姝ｇ‘鐨?size/mtime锛?
 // P0 宸查獙璇侊紱ModeIrregular 涓嶅奖鍝嶆湰鐢ㄩ€旓級銆?
 func (l *localFS) Scan() ([]engine.CloudEntry, error) {
+	// 先收敛物理名：rclone 读不到的全角名（：？＜＞…）改名成引擎键（踩坑 #26），
+	// 否则本轮 upload 源侧 copyfile 必 404。改名在 walk 之前自顶向下完成，
+	// 本轮扫描看到的就是收敛后的最终路径（无“改名后子项漏扫一轮”问题）。
+	convergeNames(l.root, l.nm)
 	var out []engine.CloudEntry
 	root := l.root
 	err := filepath.Walk(root, func(p string, info os.FileInfo, err error) error {

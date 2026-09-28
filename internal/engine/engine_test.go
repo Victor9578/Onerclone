@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"io"
 	"log"
 	"path/filepath"
@@ -374,5 +375,14 @@ func TestDeleteLocalRevivesWhenLocalChanged(t *testing.T) {
 	stats, _ := st.Stats()
 	if stats[state.StateDone] == 0 {
 		t.Fatalf("upload should complete, stats=%v", stats)
+	}
+}
+// TestClassifyCorruptPlaceholder 损坏占位符（踩坑 #24）：cldflt 对一切访问
+// 返回 "cloud file metadata is corrupt"，当轮重试无意义 → 必须归永久失败
+//（此前归 network 类导致每轮重试、日志刷屏）。
+func TestClassifyCorruptPlaceholder(t *testing.T) {
+	err := errors.New(`unlinkat D:\sync\a.pdf: The cloud file metadata is corrupt and unreadable.`)
+	if got := classify(err); got != state.ClassPermanent {
+		t.Fatalf("classify(corrupt) = %s, want permanent", got)
 	}
 }
