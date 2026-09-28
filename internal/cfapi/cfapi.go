@@ -17,6 +17,7 @@ var (
 	procGetPlatformInfo    = dll.NewProc("CfGetPlatformInfo")
 	procRegisterSyncRoot   = dll.NewProc("CfRegisterSyncRoot")
 	procUnregisterSyncRoot = dll.NewProc("CfUnregisterSyncRoot")
+	procGetSyncRootInfoByPath = dll.NewProc("CfGetSyncRootInfoByPath")
 	procConnectSyncRoot    = dll.NewProc("CfConnectSyncRoot")
 	procDisconnectSyncRoot = dll.NewProc("CfDisconnectSyncRoot")
 	procExecute            = dll.NewProc("CfExecute")
@@ -106,6 +107,79 @@ func UnregisterSyncRoot(path string) error {
 	r1, _, _ := procUnregisterSyncRoot.Call(uintptr(unsafe.Pointer(p)))
 	runtime.KeepAlive(p)
 	return hr(r1)
+}
+
+// SyncRootStandardInfo 对应 CF_SYNC_ROOT_STANDARD_INFO（可变长：ProviderName
+// 255+1、ProviderVersion 255+1 WCHAR，尾部 SyncRootIdentity[1]）。这里只
+// 取固定前缀 + 用大缓冲整体读，字段偏移按头文件 x64 布局：
+//   FileId@0(8) Hydration@8(4) Population@12(4) InSync@16(4) HardLink@20(4)
+//   ProviderStatus@24(4) pad@28 ProviderName@32(512) ProviderVersion@544(512)
+//   IdentityLen@1056(4) Identity@1060
+type SyncRootStandardInfo struct {
+	SyncRootFileId    int64
+	Hydration         uint16
+	HydrationModifier uint16
+	Population        uint16
+	PopulationModifier uint16
+	InSync            uint32
+	HardLink          uint32
+	ProviderStatus    uint32
+	ProviderName      string
+	ProviderVersion   string
+	SyncRootIdentity  []byte
+}
+
+// GetSyncRootInfoByPath 查询路径所属同步根的信息（CfGetSyncRootInfoByPath，
+// InfoClass=STANDARD）。路径不在任何同步根下 → HRESULT 0x80070186
+//（ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT 语义，实测该 API 对非同步根路径
+// 返回此码）。
+func GetSyncRootInfoByPath(path string) (*SyncRootStandardInfo, error) {
+	const (
+		maxNameW = 255 + 1
+		bufLen   = 8 + 4 + 4 + 4 + 4 + 4 + 4 + maxNameW*2 + maxNameW*2 + 4 + 256
+	)
+	buf := make([]byte, bufLen)
+	p := utf16ptr(path)
+	var returned uint32
+	r1, _, _ := procGetSyncRootInfoByPath.Call(
+		uintptr(unsafe.Pointer(p)),
+		0, // CF_SYNC_ROOT_INFO_STANDARD
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(bufLen),
+		uintptr(unsafe.Pointer(&returned)),
+	)
+	runtime.KeepAlive(p)
+	if err := hr(r1); err != nil {
+		return nil, err
+	}
+	// 解析固定前缀
+	u16 := func(off, count int) string {
+		s := (*[1 << 20]uint16)(unsafe.Pointer(&buf[off]))[:count:count]
+		return syscall.UTF16ToString(s)
+	}
+	u32 := func(off int) uint32 {
+		return *(*uint32)(unsafe.Pointer(&buf[off]))
+	}
+	u16v := func(off int) uint16 {
+		return *(*uint16)(unsafe.Pointer(&buf[off]))
+	}
+	info := &SyncRootStandardInfo{
+		SyncRootFileId:     *(*int64)(unsafe.Pointer(&buf[0])),
+		Hydration:          u16v(8),
+		HydrationModifier:  u16v(10),
+		Population:          u16v(12),
+		PopulationModifier: u16v(14),
+		InSync:              u32(16),
+		HardLink:            u32(20),
+		ProviderStatus:      u32(24),
+		ProviderName:        u16(32, maxNameW),
+		ProviderVersion:     u16(32+maxNameW*2, maxNameW),
+	}
+	idLen := int(u32(32 + maxNameW*4))
+	if idLen > 0 && 1060+idLen <= len(buf) {
+		info.SyncRootIdentity = append([]byte{}, buf[1060:1060+idLen]...)
+	}
+	return info, nil
 }
 
 // ---------- 回调会话 ----------
@@ -239,43 +313,6 @@ func (s *Session) TransferData(info *CallbackInfo, offset, length int64, buf []b
 }
 
 // fetchdata 子结构在 OperationParameters 中的布局见 types.go。
-// CF_OPERATION_PARAMETERS.TransferPlaceholders 视图（同为 40 字节）：
-// ParamSize@0, pad@4, Flags@8, CompletionStatus@12,
-// PlaceholderTotalCount@16, PlaceholderArray@24,
-// PlaceholderCount@32, EntriesProcessed@36
-type opParamsPlaceholders struct {
-	ParamSize            uint32
-	_                    uint32
-	Flags                uint32
-	CompletionStatus     int32
-	PlaceholderTotalCount int64
-	PlaceholderArray     uintptr // NULL = 不携带任何条目
-	PlaceholderCount     uint32
-	EntriesProcessed     uint32
-}
-
-// TransferPlaceholders 以 TRANSFER_PLACEHOLDERS 操作响应 FETCH_PLACEHOLDERS
-// 回调。placeholderCount=0 + 空数组 + STATUS_OK 表示"该目录没有更多待
-// 人口化条目"，目录枚举将立即返回本地已有的实体条目。
-func (s *Session) TransferPlaceholders(info *CallbackInfo, totalCount int64) error {
-	opInfo := OperationInfo{
-		StructSize:    uint32(unsafe.Sizeof(OperationInfo{})),
-		Type:          OpTypeTransferPlaceholders,
-		ConnectionKey: info.ConnectionKey,
-		TransferKey:   info.TransferKey,
-	}
-	params := opParamsPlaceholders{
-		ParamSize:            uint32(unsafe.Sizeof(opParamsPlaceholders{})),
-		PlaceholderTotalCount: totalCount,
-	}
-	r1, _, _ := procExecute.Call(
-		uintptr(unsafe.Pointer(&opInfo)),
-		uintptr(unsafe.Pointer(&params)),
-	)
-	runtime.KeepAlive(&params)
-	runtime.KeepAlive(&opInfo)
-	return hr(r1)
-}
 
 // FailTransfer 以指定 NTSTATUS 失败当前 FETCH_DATA 请求；
 // 挂起的用户 I/O 会立即以该状态失败（不会等 60s 超时）。
@@ -410,24 +447,6 @@ func ConvertToPlaceholder(path string, flags uint32) error {
 		uintptr(flags),
 		0, // ConvertUsn = NULL
 		0, // Overlapped = NULL
-	)
-	runtime.KeepAlive(p)
-	return hr(r1)
-}
-
-// ClearInSync 清除 in-sync 标记（用户修改后由平台自动做，这里备用）。
-func ClearInSync(path string) error {
-	p := utf16ptr(path)
-	h, err := syscall.CreateFile(p, fileAccessAttributes, fileShareAll, nil, openExisting, 0, 0)
-	if err != nil {
-		return err
-	}
-	defer syscall.CloseHandle(h)
-	r1, _, _ := procSetInSyncState.Call(
-		uintptr(h),
-		uintptr(InSyncStateNotInSync),
-		uintptr(SetInSyncFlagNone),
-		0,
 	)
 	runtime.KeepAlive(p)
 	return hr(r1)

@@ -1,15 +1,16 @@
 # Onerclone —— 需求与进度记录
 
-> 更新时间：2026-09-27 · 状态：**Phase 1 完成**；**Phase 2 完成**（面板只读 + 管理动作 + 冲突可视化 + 托盘 + 开机自启）；**成品已交付**：`dist\onerclone-setup-0.2.0.exe`（24.2MB，无 UAC 安装）+ `dist\onerclone-v0.2.0-win64.zip`（31.5MB）；Phase 3 剩余：双机实测、10 万文件性能压测、Office 离线弹窗
+> 更新时间：2026-09-28 · 状态：**Phase 1/2 完成**（成品 v0.2.0 已交付）；**Phase 4（v0.2.0 用户反馈三问题）代码已全部实施（2026-09-28，本机）**，待真机验收 + 出 v0.3.0 包；Phase 3 剩余：双机实测、10 万文件性能压测、Office 离线弹窗
 
 ---
 
-## 0. 环境变更（2026-09-25，新机器/新路径）
+## 0. 环境变更（2026-09-28，又换了一台机器）
 
-- Go：`D:\Software\go\bin\go.exe`（v1.27.1，已加入用户 PATH；官方 zip 解压安装）
-- rclone：`D:\Software\rclone\rclone.exe`（**v1.70.0-quark**，含 quark backend + rc ✓）
-- 仓库：`D:\0Code\Onerclone`
-- spike 默认 `-rclone` flag 已改为新路径
+- Go：`D:\0Project\Go\bin\go.exe`（v1.27.1，在 PATH 里）
+- rclone：`D:\Tools\rclone\rclone.exe`（**v1.70.0-quark**，含 quark backend + rc ✓；不在 PATH）
+- 仓库：`D:\0Project\0repos\Onerclone`
+- Inno Setup：本机未装（出安装包前需 `winget install JRSoftware.InnoSetup --scope user`）
+- 代码侧已适配：`resolveRclone` 兜底改为 `D:\Tools` → `D:\Software` 依次找；`build.ps1` 同款候选列表
 
 ---
 
@@ -407,8 +408,65 @@ cd D:\0Code\Onerclone
 3. 问题 ③（通用登录状态机，工作量最大；② 的设置区先落地，③ 复用其 remote 下拉）
 4. 全部完成后 `build.ps1 -Version 0.3.0 -Installer` 出新包，真机验收三项
 
+---
+
+## 12. Phase 4 实施记录（2026-09-28，本机完成代码，待真机验收）
+
+> 上轮（§11）定的三个修复方案本轮**全部落码**。全量测试 + vet 绿；rclone 协议侧
+> 用本机 v1.70.0-quark 实测过 `config providers`（顶层数组）与 ftp 完成态。
+
+### ✅ 问题 ① Explorer 状态图标 —— `cmdRun` 自动补 Shell 注册
+
+- `cmdRun` 在 `CfConnectSyncRoot` 成功后自动调 `shellRegister(root)`（幂等，失败只记日志）
+- `shellreg.go`：HKLM 写被拒时**降级写 HKCU**（OneDrive 同款层级，Explorer 两层都认）；`shellUnregister` 同时清理两层
+- 验收待做：用户机器装 v0.3.0 → 注册表键出现 → 重启 Explorer → 云朵/绿勾显示
+
+### ✅ 问题 ② 同步根可自定义 —— state.db 解耦 + 换根迁移 + 设置区
+
+- **state.db 固定放 exe 同目录** `OnercloneSpike.state\state.db`（不可写退回 `%LocalAppData%\Onerclone`）——换根不丢队列/基线/namemap
+- **remote 指纹**（meta `remote_fingerprint`）：启动时对比，变更即 `ResetCloudSnap()`（清 cloud_snap + 重置基线，防踩坑 #13 误删）
+- **换根自动迁移** `migrateSyncRoot`：meta 记住上次注册根；变更时先 `CfGetSyncRootInfoByPath` 确认旧根确属本 provider（新增 cfapi 绑定，STANDARD info 解析 ProviderName）→ 注销旧根（内核 + Shell）→ 注册新根
+- **面板设置区**：`GET/POST /api/settings`（改 `sync_root`/`remote` → `saveConfig` 写回 onerclone.json，提示重启生效；POST 前用 `GetVolumeInformationW` 校验 NTFS）+ `GET /api/remotes`（下拉）；UI 加「设置」卡片
+- `saveConfig`：只覆盖给出的字段（零值保留磁盘值），容忍 BOM
+
+### ✅ 问题 ③ 开放任意 rclone 后端 —— 通用登录状态机
+
+- 新文件 `cmd/spike/login.go`：
+  - `listProviders`：`config providers` 列后端（**实测输出是顶层数组**，非 `{Providers:[]}` 包装；过滤 alias/crypt/local 等组合后端）
+  - `loginStart`/`loginAnswer`：驱动 `config create --non-interactive` 状态机（`--continue --state X --result Y`），全程套用踩坑 #18 的 conf 快照/恢复
+  - `onerclone login [-type T] [-name N]`：CLI 逐题作答；`*oauth-islocal` 自动答 true（rclone 自己开浏览器）；`*oauth-authorize` 渲染粘贴 token；quark 扫码转交现有 `quarkQRLogin`
+- 面板端点：`GET /api/providers`、`POST /api/login/start`（OAuth islocal 自动推进、quark 复用现有二维码轮询）、`POST /api/login/answer`；UI 加「添加远程存储」卡片（类型下拉 + 逐题表单 + 二维码 + OAuth 浏览器提示）
+- 引擎零改动：`onerclone.json` 的 `remote` 本就是任意 rclone remote 语法
+
+### 本轮踩坑（续编号）
+
+19. **`rclone config providers` 输出是顶层数组**：不是 `{"Providers":[...]}` 包装，直接 `json.Unmarshal([]byte, &[]struct{...})`。首版按包装解析报 unmarshal 错。
+20. **ftp 等无必填后端登录后 `lsd` 验证必失败**（无 host 凭据 NewFS 直接报错）——CLI 的"验证连接"步骤对这类后端是预期失败，登录本身（写 conf）已成功；真机验收时用 dropbox/quark 这类有真实凭据流的后端验证。
+21. **纯配置命令会污染发布目录**：`login`/`quark-login` 走 `loadConfig()` 首次运行会在 exe 旁生成 `onerclone.json` 模板 + `onerclone.log`——在 dist 里冒烟一次就把模板写进了发布包。修：`loadConfigOpt(false)` 只读不写（login/quark-login 用），`build.ps1` 已有防御性删除但根因在命令侧。
+
+### 🧹 清理（2026-09-28，出包前）
+
+- 删除 `tmp_stat/`（占位符属性诊断探针，gitignore 规则早于文件、曾被误跟踪）
+- 删除 `spike-remote/`（本地替身测试数据；`ensureSample` 会自动重建，已入 .gitignore）
+- 删除 `final_zoom.png`/`verify_final.png`（P0 图标验收截图，结论已记录在 §6；.gitignore 改为 `*.png` 全排除）
+- 死代码：`handleFetchPlaceholders` + `fetchPhMu/fetchPhCount`（回调表只注册 FETCH_DATA，永不触发）、`cfapi.TransferPlaceholders` + `opParamsPlaceholders`、`cfapi.ClearInSync`、`hrNotCloudFile`/`selfWriteWindow` 常量（P0 遗留，无引用）
+
+### ✅ v0.3.0 包已出（2026-09-28）
+
+- `dist\onerclone-v0.3.0-win64\`（onerclone.exe 12.1MB + rclone.exe 77.6MB + README + VERSION）+ `dist\onerclone-v0.3.0-win64.zip`（31.7MB）
+- rclone 从本机 `D:\Tools` 自动带入；冒烟：version ✓ / help ✓ / login providers 列表 ✓（dropbox/quark 在列）/ 发布目录无 log/json/state 污染 ✓
+- 安装包（Inno）未出：本机没装 Inno Setup，需要时 `winget install JRSoftware.InnoSetup --scope user` 后跑 `.\build.ps1 -Version 0.3.0 -Installer`
+
+### ⬜ Phase 4 剩余（换机/用户侧）
+
+- [ ] 真机验收三项：① 图标显示（重启 Explorer）② 换根迁移 + 设置区 ③ 通用登录（建议 dropbox OAuth + quark 扫码各走一遍）
+- [ ] `build.ps1 -Version 0.3.0 -Installer` 出新包（本机先装 Inno Setup）
+- [ ] Office 离线弹窗肉眼验收（Phase 3 遗留）
+- [ ] 双机实测、10 万文件压测（Phase 3 遗留）
+
 ### 本轮对话存档
 
 - 本文件 §11 即上轮对话的完整结论存档（换设备后从 §11 的「修复方案」接续实施即可）
 - 代码现状：`main` @ `0897ba0`（Phase 2 complete），工作区干净，已推 GitHub
 - 本机环境（2026-09-28）：Go `D:\Software\go\bin\go.exe`（v1.27.1）、rclone `D:\Software\rclone\rclone.exe`（v1.70.0-quark）、仓库 `D:\0Code\Onerclone`、Inno Setup 6.7.3（user scope）
+- **2026-09-28 续**：§11 三项方案已在新机（本机）全部实施完毕，见 §12；环境路径见 §0

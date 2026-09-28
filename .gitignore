@@ -15,11 +15,11 @@ brace_depth.txt
 tmp_line/
 tmp_stat/
 
-# 验证截图（保留 final_zoom/verify_final 作验收证据，其余不入库）
-explorer_*.png
-onedrive_*.png
-files_zoom.png
-final_full.png
+# 本地替身测试数据（ensureSample 会自动重新生成）
+/spike-remote/
+
+# 验收截图（证据已存档进 PROGRESS.md 文字记录，不入库）
+*.png
 srm.reg
 captured_*.reg
 watchlog.txt

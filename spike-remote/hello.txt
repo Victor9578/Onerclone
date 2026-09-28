@@ -1,8 +1,0 @@
-Hello from Onerclone spike!
-这一行证明：占位符 -> FETCH_DATA -> rclone RC -> 回填 全链路打通。
-0123456789abcdef 0123456789abcdef 0123456789abcdef 0123456789abcdef 0123456789abcdef 0123456789abcdef 0123456789abcdef 0123456789abcdef 
-ROUND4
-ROUND5
-ROUND6
-ROUND7
-P1-LOCAL

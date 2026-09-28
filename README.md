@@ -29,6 +29,14 @@
 .\onerclone.exe
 ```
 
+想用夸克以外的存储（Dropbox / OneDrive / WebDAV / SFTP…）？
+
+```powershell
+.\onerclone.exe login              # 列出全部可登录后端
+.\onerclone.exe login -type dropbox # 通用登录（OAuth 自动开浏览器；扫码后端出二维码）
+# 然后在面板「设置」区把 remote 换成 dropbox: 保存并重启
+```
+
 启动后：
 
 - 日志里打印**一次性面板链接**（每 2 秒刷新）
@@ -50,6 +58,8 @@
 | 队列动作 | 类型/状态/重试次数/下次执行/最近错误；行内**重试 / 放弃 / 脱水** |
 | 冲突副本 | 两端快照（大小/时间）+ 本地/云端冲突副本路径（Q7/Q18 双保留） |
 | 扫码登录 | 点“开始扫码”→ 页面出二维码（PNG）→ 手机确认 → 自动恢复队列 |
+| 设置 | 改同步根 / 换 remote（写回 `onerclone.json`，重启生效；换根自动迁移注册） |
+| 添加远程存储 | 选后端类型 → 逐题表单登录（OAuth 自动开浏览器 / 扫码出二维码 / 普通必填项表单） |
 
 说明：脱水 = 释放本地数据、只留占位符；执行前会复查本地是否已改（改过则转冲突，不丢数据）。
 
@@ -81,6 +91,7 @@ onerclone                    直接开始同步（读 onerclone.json）
 onerclone run [flags]        同上，flag 覆盖配置
                              -root -remote -fs -rclone -offline
 onerclone quark-login        扫码登录夸克（需真实控制台；-tries N 超时自动重出二维码）
+onerclone login [-type T]    通用登录任意 rclone 后端（省略 -type 列出全部可选）
 onerclone autostart          查询开机自启；-enable/-disable 开关（HKCU，无需 UAC）
 onerclone register   [-root] 注册同步根（普通用户即可，无需 UAC）
 onerclone unregister [-root] 注销同步根
@@ -116,6 +127,7 @@ onerclone help               帮助
 
 - 托盘图标只有一个静态样式（无“在线/离线”状态区分）；菜单动作见上
 - 面板扫码若中途关掉程序，会自动把原 cookie 写回（登录态不丢）；扫描成功前不要同时跑 `quark-login`
-- `rclone.exe` 必须是夸克 fork；官方 rclone 没有 quark backend
-- 同步根换盘/改名后需 `unregister` + `register`
+- `rclone.exe` 必须是夸克 fork；官方 rclone 没有 quark backend（用其他后端时官方版亦可）
+- 换同步根：直接在面板设置区改（或改 `onerclone.json`）重启即可——自动注销旧根注册、迁移到新根；状态库在 exe 同目录，队列/基线不丢
+- 换 remote：面板设置区改后重启——云端基线自动作废重建（防误删）；换根不等于换 remote，两者独立
 - 卸载：控制面板/设置里卸载 Onerclone（会关自启并注销同步根；正在运行时注销会失败，属预期）

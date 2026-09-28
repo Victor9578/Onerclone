@@ -9,6 +9,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -65,7 +66,11 @@ func configPaths() []string {
 }
 
 // loadConfig 读配置；不存在则用内置默认并生成模板（首次运行友好）。
-func loadConfig() config {
+// writeTemplate=false 时只读不写（login/quark-login 等纯配置命令用，
+// 避免在 exe 旁生成模板污染发布目录）。
+func loadConfig() config { return loadConfigOpt(true) }
+
+func loadConfigOpt(writeTemplate bool) config {
 	paths := configPaths()
 	for _, p := range paths {
 		b, err := os.ReadFile(p)
@@ -89,6 +94,9 @@ func loadConfig() config {
 	// 首次运行：写出模板
 	c := defaultConfig()
 	c.applyDefaults()
+	if !writeTemplate {
+		return c
+	}
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err == nil {
 		for _, p := range paths {
@@ -116,6 +124,58 @@ func pick(flagVal, cfgVal, def string) string {
 	return def
 }
 
+// configWritePath 返回配置写回目标：已存在的配置文件优先（保持用户
+// 手改的字段），否则 exe 同目录，再否则用户配置目录。
+func configWritePath() string {
+	paths := configPaths()
+	for _, p := range paths {
+		if fileExists(p) {
+			return p
+		}
+	}
+	for _, p := range paths {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// saveConfig 把配置写回 onerclone.json（面板设置区用）。只覆盖给出的
+// 字段：零值字段保留磁盘上已有配置的值，避免把用户没动的字段抹掉。
+func saveConfig(patch config) (string, error) {
+	p := configWritePath()
+	if p == "" {
+		return "", fmt.Errorf("找不到可写的配置目录")
+	}
+	cur := defaultConfig()
+	if b, err := os.ReadFile(p); err == nil {
+		b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
+		_ = json.Unmarshal(b, &cur) // 解析失败则从默认开始
+	}
+	if patch.SyncRoot != "" {
+		cur.SyncRoot = patch.SyncRoot
+	}
+	if patch.Remote != "" {
+		cur.Remote = patch.Remote
+	}
+	if patch.Fs != "" {
+		cur.Fs = patch.Fs
+	}
+	if patch.Rclone != "" {
+		cur.Rclone = patch.Rclone
+	}
+	cur.Offline = patch.Offline || cur.Offline
+	data, err := json.MarshalIndent(cur, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(p, append(data, '\n'), 0o644); err != nil {
+		return "", err
+	}
+	return p, nil
+}
+
 // resolveRclone 找 rclone 可执行文件：flag → 配置 → exe 同目录 → PATH → 兜底。
 func resolveRclone(flagVal, cfgVal string) string {
 	if flagVal != "" {
@@ -138,7 +198,16 @@ func resolveRclone(flagVal, cfgVal string) string {
 	if p, err := exec.LookPath("rclone"); err == nil {
 		return p
 	}
-	return `D:\Software\rclone\rclone.exe` // 本机兜底（找不到时由后续报错暴露）
+	// 兜底候选（按本机常见安装位置依次找；找不到时由后续报错暴露）
+	for _, p := range []string{
+		`D:\Tools\rclone\rclone.exe`,
+		`D:\Software\rclone\rclone.exe`,
+	} {
+		if fileExists(p) {
+			return p
+		}
+	}
+	return `D:\Tools\rclone\rclone.exe`
 }
 
 // fileExists 是普通文件存在性判断。

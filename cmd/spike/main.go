@@ -41,10 +41,7 @@ import (
 const (
 	hrAlreadyExists = 0x800700B7 // ERROR_ALREADY_EXISTS → HRESULT
 	hrAccessDenied  = 0x80070005 // ERROR_ACCESS_DENIED → HRESULT
-	hrNotCloudFile  = 0x80070178 // ERROR_NOT_CLOUD_FILE → 文件还不是占位符
 
-	// 本程序写入本地后的回声抑制窗口：期间该路径的 watcher 事件视为自写
-	selfWriteWindow = 15 * time.Second
 	// 写入防抖窗口（FR4）
 	debounceWindow = 3 * time.Second
 )
@@ -77,10 +74,6 @@ type app struct {
 	// watcher 触发全量扫描的节流（引擎自身有 mu，这里防扫描风暴）
 	scanMu      sync.Mutex
 	scanPending *time.Timer
-
-	// FETCH_PLACEHOLDERS 限流日志计数
-	fetchPhMu    sync.Mutex
-	fetchPhCount int
 }
 
 func defaultRoot() string {
@@ -171,6 +164,8 @@ func main() {
 		cmdRun(os.Args[2:])
 	case "quark-login":
 		cmdQuarkLogin(os.Args[2:])
+	case "login":
+		cmdLogin(os.Args[2:])
 	case "autostart":
 		cmdAutostart(os.Args[2:])
 	case "version", "-version", "--version":
@@ -190,6 +185,7 @@ func usage() {
   onerclone                    直接开始同步（读 exe 同目录 onerclone.json）
   onerclone run [flags]        同上，flag 可覆盖配置
   onerclone quark-login        扫码登录夸克（需真实控制台；-tries N 超时自动重出二维码）
+  onerclone login [-type T]    通用登录任意 rclone 后端（dropbox/onedrive/…；省略 -type 列出全部）
   onerclone autostart          查询开机自启；-enable/-disable 开关
   onerclone register   [-root DIR]   注册同步根（内核 + Shell 图标层）
   onerclone unregister [-root DIR]   注销同步根
@@ -390,6 +386,12 @@ func cmdRun(args []string) {
 	// 4) 确保注册策略为最新（Population=ALWAYS_FULL 需重新注册才生效），
 	// 然后连接同步根（只注册 FETCH_DATA —— ALWAYS_FULL 下平台不会问
 	// FETCH_PLACEHOLDERS，与微软 CloudMirror 示例一致）
+	// v0.2.0 反馈问题②：换根自动迁移——若配置的根不是本 provider 注册的
+	// 根（用户改了 sync_root），自动注销旧根再注册新根，避免 Explorer 里
+	// 旧目录残留云图标、新目录不生效。
+	if err := migrateSyncRoot(a.syncRoot); err != nil {
+		log.Printf("⚠ 同步根迁移检查失败（继续尝试注册当前根）: %v", err)
+	}
 	if err := cfapi.RegisterSyncRoot(a.syncRoot,
 		cfapi.NewRegistration(providerName, providerVersion, []byte(syncRootID), []byte(fileIdentityID)),
 		cfapi.NewPolicies(), cfapi.RegisterFlagUpdate); err != nil {
@@ -406,8 +408,20 @@ func cmdRun(args []string) {
 	defer a.session.Disconnect()
 	log.Print("同步根已连接（FETCH_DATA 回调在线）")
 
+	// 4.5) Shell 集成自动补注册（v0.2.0 用户反馈问题①）：CfRegisterSyncRoot
+	// 只做内核层注册，不写 Explorer 依赖的 SyncRootManager 注册表项 →
+	// 双击 exe 直接跑的成品用户永远看不到云朵/绿勾图标。这里每次启动
+	// 自动补写（幂等），失败只记日志不影响同步。
+	if err := shellRegister(a.syncRoot); err != nil {
+		log.Printf("⚠ Shell 注册失败（状态图标将不显示，同步不受影响）: %v", err)
+	} else {
+		log.Print("✅ Shell 注册成功（SyncRootManager ✓ 状态图标已启用）")
+	}
+
 	// 5) 打开 P1 状态库 + 建引擎（三库模型：local_snap/cloud_snap/queue）
-	statePath := filepath.Join(filepath.Dir(a.syncRoot), "OnercloneSpike.state", "state.db")
+	// v0.2.0 反馈问题②：state.db 固定放 exe 同目录（或用户数据目录），
+	// 与同步根**解耦**——换根不丢队列/基线/namemap，旧根下不再残留状态库。
+	statePath := statePath()
 	if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
 		log.Fatalf("创建状态目录失败: %v", err)
 	}
@@ -417,6 +431,22 @@ func cmdRun(args []string) {
 	}
 	defer a.store.Close()
 	log.Printf("状态库: %s", statePath)
+
+	// remote 指纹（踩坑 #13）：cloud_snap 是"上次在哪个后端看到什么"的
+	// 真相，换了 remote 旧快照里的条目在新后端不存在 → 会被判"云端已删"
+	// → 误删本地文件。指纹变更即清空 cloud_snap + 重置基线（DR2 重新保护）。
+	remoteFP := a.fsRoot
+	if v, ok, err := a.store.GetMeta("remote_fingerprint"); err != nil {
+		log.Printf("⚠ 读 remote 指纹失败: %v", err)
+	} else if ok && v != remoteFP {
+		if err := a.store.ResetCloudSnap(); err != nil {
+			log.Fatalf("切换 remote 后重置云端快照失败: %v", err)
+		}
+		log.Printf("🔄 检测到 remote 变更（%s → %s）：已清空云端快照并重建基线", v, remoteFP)
+	}
+	if err := a.store.SetMeta("remote_fingerprint", remoteFP); err != nil {
+		log.Printf("⚠ 写 remote 指纹失败: %v", err)
+	}
 
 	// 云端名↔本地名 映射表（从 meta 恢复上次的改名记录）
 	a.nm = newNameMap(a.store)
@@ -515,6 +545,98 @@ func trimOutput(s string) string {
 	return "..." + s[len(s)-max:]
 }
 
+// statePath 返回状态库路径（与同步根解耦，v0.2.0 反馈问题②）：
+// exe 同目录 OnercloneSpike.state\state.db；exe 目录不可写（如 Program
+// Files）时退回 %LocalAppData%\Onerclone。换同步根不再丢队列/基线。
+func statePath() string {
+	if exe, err := os.Executable(); err == nil && exe != "" {
+		p := filepath.Join(filepath.Dir(exe), "OnercloneSpike.state", "state.db")
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err == nil {
+			return p
+		}
+	}
+	if d, err := os.UserCacheDir(); err == nil && d != "" { // Windows: %LocalAppData%
+		return filepath.Join(d, "Onerclone", "state.db")
+	}
+	return filepath.Join(filepath.Dir(defaultRoot()), "OnercloneSpike.state", "state.db")
+}
+
+// hrNotSyncRoot 是"路径不在同步根下"的错误码（CfGetSyncRootInfoByPath
+// 对非同步根路径的返回；ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT）。
+const hrNotSyncRoot = 0x80070186
+
+// checkNTFS 校验路径所在卷是 NTFS（cfapi 硬约束：仅 NTFS 支持 Cloud Files）。
+func checkNTFS(path string) error {
+	if vol := filepath.VolumeName(path); vol != "" {
+		if fs, err := getVolumeFS(vol); err == nil && !strings.EqualFold(fs, "NTFS") {
+			return fmt.Errorf("%s 是 %s 卷（cfapi 仅支持 NTFS）", vol, fs)
+		}
+	}
+	return nil
+}
+
+// getVolumeFS 返回卷的文件系统名（如 NTFS / ReFS / FAT32）。
+func getVolumeFS(vol string) (string, error) {
+	// GetVolumeInformationW：根路径必须以 \ 结尾
+	root := vol
+	if !strings.HasSuffix(root, `\`) {
+		root += `\`
+	}
+	p, err := syscall.UTF16PtrFromString(root)
+	if err != nil {
+		return "", err
+	}
+	var fsName [32]uint16
+	kernel32 := syscall.NewLazyDLL("kernel32.dll")
+	r1, _, e := kernel32.NewProc("GetVolumeInformationW").Call(
+		uintptr(unsafe.Pointer(p)),
+		0, 0, 0, 0,
+		uintptr(unsafe.Pointer(&fsName[0])),
+		uintptr(len(fsName)),
+	)
+	if r1 == 0 {
+		return "", e
+	}
+	return syscall.UTF16ToString(fsName[:]), nil
+}
+
+// migrateSyncRoot 换根迁移（v0.2.0 反馈问题②）：配置的根若不是本
+// provider 注册的同步根，自动注销旧根（内核 + Shell 层）再让调用方注册
+// 新根。旧根不存在/已注销的报错一律忽略（幂等）。
+func migrateSyncRoot(newRoot string) error {
+	// 记住上次注册的根（state meta；state.db 已与同步根解耦，跨根可读）
+	sp := statePath()
+	st, err := state.Open(sp)
+	if err != nil {
+		return fmt.Errorf("打开状态库: %w", err)
+	}
+	defer st.Close()
+	last, hadLast, err := st.GetMeta("registered_root")
+	if err != nil {
+		return err
+	}
+	if !hadLast || strings.EqualFold(last, newRoot) {
+		_ = st.SetMeta("registered_root", newRoot)
+		return nil
+	}
+
+	// 根变了：确认旧根确实是本 provider 的同步根才注销（防止误注销别人的）
+	if info, err := cfapi.GetSyncRootInfoByPath(last); err == nil &&
+		info.ProviderName == providerName {
+		log.Printf("🔄 检测到同步根变更: %s → %s，自动注销旧根", last, newRoot)
+		if err := cfapi.UnregisterSyncRoot(last); err != nil {
+			log.Printf("⚠ 旧根注销失败（%v），继续注册新根", err)
+		}
+		if err := shellUnregister(); err != nil {
+			log.Printf("⚠ 旧根 Shell 注销失败: %v", err)
+		}
+	} else {
+		log.Printf("🔄 同步根变更: %s → %s（旧根已非本 provider 注册，跳过注销）", last, newRoot)
+	}
+	_ = st.SetMeta("registered_root", newRoot)
+	return nil
+}
+
 // populate 递归列举远程目录并在本地创建占位符，返回文件数。
 func (a *app) populate(remoteRel, localDir string) (int, error) {
 	entries, err := a.rc.Load().List(a.fsRoot, remoteRel)
@@ -564,32 +686,6 @@ func (a *app) populate(remoteRel, localDir string) (int, error) {
 		log.Printf("⚠ 占位符创建失败 %s: HRESULT 0x%08X", items[i].RelativeFileName, uint32(hr))
 	}
 	return total, nil
-}
-
-// handleFetchPlaceholders —— 目录人口化回调。Population=PARTIAL 时平台在
-// 枚举/路径解析目录前会询问 provider 有哪些待落地条目；不响应 = 60s 超时
-// （实测 60.8s 报"云操作超时"）。我们的模型是占位符全部预先创建，
-// 故答复"没有更多条目"，枚举立即返回本地实体。
-func (a *app) handleFetchPlaceholders(info *cfapi.CallbackInfo, params *cfapi.CallbackParameters) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("✗ FETCH_PLACEHOLDERS panic: %v", r)
-		}
-	}()
-	vol := cfapi.StringFromUTF16Ptr(info.VolumeDosName)
-	dir := vol + cfapi.StringFromUTF16Ptr(info.NormalizedPath)
-	if err := a.session.TransferPlaceholders(info, 0); err != nil {
-		log.Printf("✗ FETCH_PLACEHOLDERS 应答失败 %s: %v", dir, err)
-		return
-	}
-	// 限流日志：单次枚举可能触发上百次，只记首次和每 100 次
-	a.fetchPhMu.Lock()
-	a.fetchPhCount++
-	n := a.fetchPhCount
-	a.fetchPhMu.Unlock()
-	if n == 1 || n%100 == 0 {
-		log.Printf("📋 FETCH_PLACEHOLDERS 已答复“无待人口化条目”（累计 %d 次）", n)
-	}
 }
 
 // handleFetchData —— 水合核心：系统要读哪段，就从 rclone RC 取哪段回填。

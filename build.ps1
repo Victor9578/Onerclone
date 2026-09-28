@@ -43,13 +43,14 @@ Write-Host ("  onerclone.exe  {0:N1} MB" -f ($exe.Length / 1MB))
 
 Write-Host '== 3/4 组装发布目录 ==' -ForegroundColor Cyan
 # 夸克专用 rclone fork（成品必需；放在 exe 同目录可被自动发现）
-$rcloneSrc = 'D:\Software\rclone\rclone.exe'
-if (Test-Path $rcloneSrc) {
+$rcloneCandidates = @('D:\Tools\rclone\rclone.exe', 'D:\Software\rclone\rclone.exe')
+$rcloneSrc = $rcloneCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if ($rcloneSrc) {
     Copy-Item $rcloneSrc (Join-Path $stage 'rclone.exe')
     $rc = Get-Item (Join-Path $stage 'rclone.exe')
-    Write-Host ("  + rclone.exe  {0:N1} MB" -f ($rc.Length / 1MB))
+    Write-Host ("  + rclone.exe  {0:N1} MB  ← {1}" -f ($rc.Length / 1MB), $rcloneSrc)
 } else {
-    Write-Warning '  未找到 D:\Software\rclone\rclone.exe —— 发布包不含 rclone（使用者需自备夸克 fork）'
+    Write-Warning '  未找到 rclone.exe（D:\Tools 或 D:\Software）—— 发布包不含 rclone（使用者需自备夸克 fork）'
 }
 
 Copy-Item (Join-Path $root 'README.md') (Join-Path $stage 'README.md')

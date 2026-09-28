@@ -245,6 +245,17 @@ func (s *Store) AllSnap(table string) (map[string]FileSnap, error) {
 	return out, rows.Err()
 }
 
+// ResetCloudSnap 清空云端快照并重置基线（换 remote 时调用，见踩坑 #13：
+// cloud_snap 是"上次在哪个后端看到什么"的真相，旧快照里的条目在新后端
+// 不存在 → 会被判"云端已删"→ 误删本地文件）。
+func (s *Store) ResetCloudSnap() error {
+	if _, err := s.db.Exec(`DELETE FROM cloud_snap`); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`DELETE FROM meta WHERE k='baseline_done'`)
+	return err
+}
+
 // ---------- 队列 ----------
 
 // Enqueue 入队（幂等：同 path+kind 合并重置为 pending；仅 inflight 不动——

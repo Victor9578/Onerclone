@@ -60,8 +60,8 @@ func cmdQuarkLogin(args []string) {
 	interactive := fs.Bool("interactive", false, "交给 rclone 终端渲染二维码（fork 下实测无输出）")
 	tries := fs.Int("tries", 5, "二维码超时后的自动重出次数（每次约 3 分钟）")
 	_ = fs.Parse(args)
-	// 优先级：flag > onerclone.json > 自动发现
-	*rcloneExe = resolveRclone(*rcloneExe, loadConfig().Rclone)
+	// 优先级：flag > onerclone.json > 自动发现（纯配置命令：只读不写模板）
+	*rcloneExe = resolveRclone(*rcloneExe, loadConfigOpt(false).Rclone)
 
 	// 1) 存在性判断：listremotes 输出 remote 名列表（config show 对不存在的
 	// remote 也会输出 "[name]" 头，不可靠）

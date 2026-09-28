@@ -90,6 +90,44 @@
         </div>
       </div>
     </section>
+    <section>
+      <h2>设置</h2>
+      <div class="hint">修改同步根 / 远程存储（写回 onerclone.json，重启后生效）。换根自动迁移注册；换 remote 自动重建云端基线。</div>
+      <div style="margin-top:10px;display:grid;gap:8px">
+        <label class="hint">同步根（NTFS）</label>
+        <input id="setRoot" placeholder="C:\Users\you\Onerclone" style="width:100%;background:#12141a;border:1px solid #242833;color:#e6e6e6;padding:6px 8px;border-radius:4px">
+        <label class="hint">远程存储（rclone remote）</label>
+        <select id="setRemote" style="width:100%;background:#12141a;border:1px solid #242833;color:#e6e6e6;padding:6px 8px;border-radius:4px">
+          <option value="">加载中…</option>
+        </select>
+        <div>
+          <button id="setbtn">保存设置</button>
+          <span class="hint" id="setmsg" style="margin-left:8px"></span>
+        </div>
+      </div>
+    </section>
+    <section>
+      <h2>添加远程存储</h2>
+      <div class="hint">支持任意 rclone 后端（dropbox / onedrive / drive / webdav / 夸克扫码…）。OAuth 后端会自动打开浏览器授权；扫码后端显示二维码。</div>
+      <div style="margin-top:10px;display:grid;gap:8px">
+        <div style="display:flex;gap:8px">
+          <input id="lgName" placeholder="名称（默认=类型）" style="flex:1;background:#12141a;border:1px solid #242833;color:#e6e6e6;padding:6px 8px;border-radius:4px">
+          <select id="lgType" style="flex:1;background:#12141a;border:1px solid #242833;color:#e6e6e6;padding:6px 8px;border-radius:4px">
+            <option value="">后端类型…</option>
+          </select>
+        </div>
+        <button id="lgStart">开始登录</button>
+        <div id="lgBody" hidden style="display:grid;gap:8px">
+          <div class="hint" id="lgHelp"></div>
+          <img id="lgQR" alt="二维码" hidden>
+          <div id="lgInputRow" hidden>
+            <input id="lgAnswer" placeholder="输入答案" style="width:100%;background:#12141a;border:1px solid #242833;color:#e6e6e6;padding:6px 8px;border-radius:4px">
+            <button id="lgSubmit" style="margin-top:6px">提交</button>
+          </div>
+        </div>
+        <div class="hint" id="lgMsg"></div>
+      </div>
+    </section>
   </div>
 
   <footer>只读面板 · 127.0.0.1 · 一次性链接已消费，凭 Cookie 访问 · 每 2s 刷新</footer>
@@ -250,6 +288,130 @@ document.getElementById('qbtn').addEventListener('click', quarkStart);
     }
   } catch (e) { /* 首次加载忽略 */ }
 })();
+
+// ---------- 设置区 ----------
+async function loadSettings() {
+  try {
+    const r = await fetch('/api/settings');
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j.sync_root) $('setRoot').value = j.sync_root;
+    // remote 下拉：已配置的 remotes + 当前值
+    const sel = $('setRemote');
+    const cur = j.remote || '';
+    let opts = '';
+    const r2 = await fetch('/api/remotes');
+    if (r2.ok) {
+      const j2 = await r2.json();
+      for (const m of (j2.remotes || [])) opts += `<option value="${esc(m)}">${esc(m)}</option>`;
+    }
+    opts += `<option value="${esc(cur)}">${esc(cur)}（当前）</option>`;
+    sel.innerHTML = opts;
+    sel.value = cur;
+  } catch (e) { /* 忽略 */ }
+}
+async function saveSettings() {
+  const body = { sync_root: $('setRoot').value.trim(), remote: $('setRemote').value.trim() };
+  if (!body.sync_root && !body.remote) { $('setmsg').textContent = '没有改动'; return; }
+  $('setbtn').disabled = true;
+  $('setmsg').textContent = '保存中…';
+  try {
+    const r = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { $('setmsg').textContent = '失败：' + (j.error || j.hint || ('HTTP ' + r.status)); return; }
+    $('setmsg').textContent = '✅ 已保存，重启 onerclone 后生效';
+  } catch (e) {
+    $('setmsg').textContent = '失败：' + e;
+  } finally {
+    $('setbtn').disabled = false;
+  }
+}
+document.getElementById('setbtn').addEventListener('click', saveSettings);
+loadSettings();
+
+// ---------- 添加远程存储（通用登录状态机） ----------
+async function loadProviders() {
+  try {
+    const r = await fetch('/api/providers');
+    if (!r.ok) return;
+    const j = await r.json();
+    const sel = $('lgType');
+    let opts = '<option value="">后端类型…</option>';
+    for (const p of (j.providers || [])) {
+      opts += `<option value="${esc(p.Name)}">${esc(p.Name)} — ${esc(p.Description || '')}</option>`;
+    }
+    sel.innerHTML = opts;
+  } catch (e) { /* 忽略 */ }
+}
+function renderLoginQuestion(j) {
+  const body = $('lgBody'), help = $('lgHelp'), qr = $('lgQR'), row = $('lgInputRow');
+  body.hidden = false;
+  if (j.phase === 'done') {
+    help.innerHTML = '✅ 登录完成：' + esc(j.name) + ':（在上方设置区选择它并保存，重启生效）';
+    qr.hidden = true; row.hidden = true;
+    loadSettings(); // 刷新 remote 下拉
+    return;
+  }
+  if (j.phase === 'failed') {
+    help.innerHTML = '❌ 失败：' + esc(j.err || '');
+    qr.hidden = true; row.hidden = true;
+    return;
+  }
+  const q = j.question || {};
+  // quark 扫码：复用二维码渲染
+  if (j.type === 'quark') {
+    help.textContent = '请用夸克 APP 扫码并在手机上确认…';
+    qr.src = '/api/quark/qr.png?ts=' + Date.now();
+    qr.hidden = false; row.hidden = true;
+    quarkPoll();
+    return;
+  }
+  qr.hidden = true;
+  if (j.oauth_browser) {
+    help.innerHTML = '🌐 浏览器已打开，请完成授权后点击下方"提交"（留空即可）。';
+  } else {
+    help.innerHTML = esc((q.Option && q.Option.Help) || q.State || '');
+  }
+  row.hidden = false;
+}
+async function loginStartGeneric() {
+  const type = $('lgType').value;
+  if (!type) { $('lgMsg').textContent = '请选择后端类型'; return; }
+  $('lgMsg').textContent = '启动中…';
+  try {
+    const r = await fetch('/api/login/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: $('lgName').value.trim(), type }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { $('lgMsg').textContent = '失败：' + (j.err || j.error || ('HTTP ' + r.status)); return; }
+    $('lgMsg').textContent = '';
+    renderLoginQuestion(j);
+  } catch (e) { $('lgMsg').textContent = '失败：' + e; }
+}
+async function loginAnswerGeneric() {
+  $('lgMsg').textContent = '提交中…';
+  try {
+    const r = await fetch('/api/login/answer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ result: $('lgAnswer').value }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { $('lgMsg').textContent = '失败：' + (j.err || j.error || ('HTTP ' + r.status)); return; }
+    $('lgMsg').textContent = '';
+    $('lgAnswer').value = '';
+    renderLoginQuestion(j);
+  } catch (e) { $('lgMsg').textContent = '失败：' + e; }
+}
+document.getElementById('lgStart').addEventListener('click', loginStartGeneric);
+document.getElementById('lgSubmit').addEventListener('click', loginAnswerGeneric);
+loadProviders();
 
 async function tick() {
   try {

@@ -48,6 +48,8 @@ type panel struct {
 	token    string // 一次性访问令牌（换取 Cookie 后置空）
 	session  string // 会话 Cookie 值
 	quark    quarkStatus // 扫码登录会话（Phase 2）
+	login    loginSession // 通用登录状态机（v0.2.0 反馈问题③）
+	loginRestore func()   // 通用登录失败时恢复原 remote 参数
 	srv      *http.Server
 	listener net.Listener
 }
@@ -88,6 +90,11 @@ func startPanel(store *state.Store, eng *engine.Engine, syncRoot, fsRoot string,
 	mux.HandleFunc("/api/quark/start", p.handleQuarkStart)
 	mux.HandleFunc("/api/quark/status", p.handleQuarkStatus)
 	mux.HandleFunc("/api/quark/qr.png", p.handleQuarkQR)
+	mux.HandleFunc("/api/settings", p.handleSettings)
+	mux.HandleFunc("/api/remotes", p.handleRemotes)
+	mux.HandleFunc("/api/providers", p.handleProviders)
+	mux.HandleFunc("/api/login/start", p.handleLoginStart)
+	mux.HandleFunc("/api/login/answer", p.handleLoginAnswer)
 	p.srv = &http.Server{Handler: mux}
 	p.listener = ln
 	go func() { _ = p.srv.Serve(ln) }()
@@ -481,4 +488,234 @@ func (p *panel) handleQuarkQR(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "image/png")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write(png)
+}
+
+// ---------- 设置区（v0.2.0 反馈问题②/③） ----------
+
+// settingsReq 是设置写回请求体（零值字段 = 不改）。
+type settingsReq struct {
+	SyncRoot string `json:"sync_root"`
+	Remote   string `json:"remote"`
+}
+
+// handleSettings GET 读当前配置；POST 写回（改 sync_root/remote）。
+// 写回只动 onerclone.json，**重启后生效**（运行中的引擎不热切换——
+// cfapi 连接、watcher、队列都绑定启动时的根）。
+func (p *panel) handleSettings(w http.ResponseWriter, r *http.Request) {
+	if !p.authorized(r) {
+		http.Error(w, "403", http.StatusForbidden)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		cfg := loadConfig()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"sync_root":      cfg.SyncRoot,
+			"remote":         cfg.Remote,
+			"fs":             cfg.Fs,
+			"rclone":         cfg.Rclone,
+			"offline":        cfg.Offline,
+			"restart_needed": false, // 写回成功后前端自行提示
+		})
+	case http.MethodPost:
+		var req settingsReq
+		if err := readJSON(r, &req); err != nil {
+			http.Error(w, "400 "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.SyncRoot == "" && req.Remote == "" {
+			http.Error(w, "400 缺少 sync_root / remote", http.StatusBadRequest)
+			return
+		}
+		if req.SyncRoot != "" {
+			// 提前校验：根必须在 NTFS 卷上（cfapi 硬约束）
+			if err := checkNTFS(req.SyncRoot); err != nil {
+				http.Error(w, "400 "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		path, err := saveConfig(config{SyncRoot: req.SyncRoot, Remote: req.Remote})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "path": path,
+			"restart_needed": true,
+			"hint":           "已写入配置，重启 onerclone 后生效（换根/换 remote 会自动迁移注册并重建云端基线）",
+		})
+	default:
+		http.Error(w, "405", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleRemotes 列出 rclone 已配置的 remotes（设置区 remote 下拉用）。
+func (p *panel) handleRemotes(w http.ResponseWriter, r *http.Request) {
+	if !p.authorized(r) {
+		http.Error(w, "403", http.StatusForbidden)
+		return
+	}
+	exe := resolveRclone("", loadConfig().Rclone)
+	out, err := rcloneOutput(exe, "listremotes")
+	if err != nil {
+		http.Error(w, "rclone listremotes 失败: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	remotes := []string{}
+	for _, line := range strings.Split(out, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			remotes = append(remotes, line)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"remotes": remotes})
+}
+
+// ---------- 通用登录（v0.2.0 反馈问题③：任意 rclone 后端） ----------
+
+// loginSession 是面板驱动的通用登录状态机（同一时刻一个会话）。
+type loginSession struct {
+	Phase    string         `json:"phase"` // idle | question | done | failed
+	Name     string         `json:"name,omitempty"`
+	Type     string         `json:"type,omitempty"`
+	Question *loginQuestion `json:"question,omitempty"` // 当前题（nil = 无进行中）
+	Err      string         `json:"err,omitempty"`
+	// oauthBrowser 为 true 时前端提示"浏览器已打开，完成授权后点继续"
+	OAuthBrowser bool `json:"oauth_browser,omitempty"`
+}
+
+// loginStartReq 是 /api/login/start 请求体。
+type loginStartReq struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+// loginAnswerReq 是 /api/login/answer 请求体。
+type loginAnswerReq struct {
+	Result string `json:"result"`
+}
+
+// handleProviders 列出可登录的后端类型。
+func (p *panel) handleProviders(w http.ResponseWriter, r *http.Request) {
+	if !p.authorized(r) {
+		http.Error(w, "403", http.StatusForbidden)
+		return
+	}
+	exe := resolveRclone("", loadConfig().Rclone)
+	prov, err := listProviders(exe)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"providers": prov})
+}
+
+// handleLoginStart 启动通用登录状态机（或返回进行中的会话）。
+func (p *panel) handleLoginStart(w http.ResponseWriter, r *http.Request) {
+	if !p.requirePOST(w, r) {
+		return
+	}
+	var req loginStartReq
+	if err := readJSON(r, &req); err != nil {
+		http.Error(w, "400 "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Type == "" {
+		http.Error(w, "400 缺少 type", http.StatusBadRequest)
+		return
+	}
+	if req.Name == "" {
+		req.Name = req.Type
+	}
+	p.mu.Lock()
+	cur := p.login
+	p.mu.Unlock()
+	if cur.Phase == "question" { // 已有进行中的会话：直接返回
+		writeJSON(w, http.StatusOK, cur)
+		return
+	}
+
+	exe := resolveRclone("", loadConfig().Rclone)
+	q, restore, err := loginStart(exe, req.Name, req.Type)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, loginSession{Phase: "failed", Err: err.Error()})
+		return
+	}
+
+	sess := loginSession{Phase: "done", Name: req.Name, Type: req.Type}
+	if q != nil && q.State != "" {
+		sess.Phase = "question"
+		sess.Question = q
+		// OAuth islocal 题：自动答 true（rclone 自己开浏览器），把下一题
+		//（等回调/授权）直接带给前端
+		if q.State == "*oauth-islocal" {
+			nq, err := loginAnswer(exe, req.Name, q.State, "true")
+			if err != nil {
+				restore()
+				writeJSON(w, http.StatusInternalServerError, loginSession{Phase: "failed", Err: err.Error()})
+				return
+			}
+			if nq == nil || nq.State == "" {
+				sess.Phase = "done"
+				sess.Question = nil
+			} else {
+				sess.Question = nq
+				sess.OAuthBrowser = true // 前端提示浏览器授权
+			}
+		}
+		// quark 扫码：复用现有二维码渲染（qr_start → 前端轮询 /api/quark/*）
+		if q.State == "qr_start" || q.State == "qr_poll" {
+			if u := qrURLRe.FindString(q.Option.Help); u != "" {
+				p.mu.Lock()
+				p.quark = quarkStatus{Phase: "waiting", URL: u, Started: time.Now().Format(time.RFC3339)}
+				p.mu.Unlock()
+				sess.Question = nil
+				sess.Phase = "question"
+				// 前端看到 type=quark 就去渲染二维码并轮询 quark/status
+			}
+		}
+	}
+	p.mu.Lock()
+	p.login = sess
+	p.loginRestore = restore
+	p.mu.Unlock()
+	writeJSON(w, http.StatusOK, sess)
+}
+
+// handleLoginAnswer 推进通用登录状态机。
+func (p *panel) handleLoginAnswer(w http.ResponseWriter, r *http.Request) {
+	if !p.requirePOST(w, r) {
+		return
+	}
+	var req loginAnswerReq
+	if err := readJSON(r, &req); err != nil {
+		http.Error(w, "400 "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	p.mu.Lock()
+	cur := p.login
+	restore := p.loginRestore
+	p.mu.Unlock()
+	if cur.Phase != "question" || cur.Question == nil {
+		http.Error(w, "409 没有进行中的登录会话", http.StatusConflict)
+		return
+	}
+	exe := resolveRclone("", loadConfig().Rclone)
+	nq, err := loginAnswer(exe, cur.Name, cur.Question.State, req.Result)
+	if err != nil {
+		restore()
+		p.mu.Lock()
+		p.login = loginSession{Phase: "failed", Name: cur.Name, Type: cur.Type, Err: err.Error()}
+		p.mu.Unlock()
+		writeJSON(w, http.StatusOK, p.login)
+		return
+	}
+	sess := loginSession{Phase: "done", Name: cur.Name, Type: cur.Type}
+	if nq != nil && nq.State != "" {
+		sess.Phase = "question"
+		sess.Question = nq
+	}
+	p.mu.Lock()
+	p.login = sess
+	p.mu.Unlock()
+	writeJSON(w, http.StatusOK, sess)
 }
