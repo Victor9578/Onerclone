@@ -573,3 +573,26 @@ cd D:\0Code\Onerclone
   已上传文件（`附件3…%EF%BC%88…`、`附件4东北证券…`、`程序化交易报备…`）。
 - `附图1-5 + 安康…pdf`（17_旬阳招投标 全部 6 个文件）均为坏占位符（363），待重启处置。
 
+### v0.3.3 / v0.3.4 增量（同日 15:10–16:00 第二轮真机反馈）
+
+> 用户重启 → 换根 `D:\Onerclone` → v0.3.2 复测：**18 个上传全部成功**，但暴露两个新问题。
+
+| # | 现象 | 根因 | 修复 |
+|---|---|---|---|
+| ⑤ | 3/18 `⚠ 上传成功但本地收尾失败: cfapi: open for convert: Access is denied` | 源文件带 **FILE_ATTRIBUTE_READONLY**（只读源拷贝）→ Windows 拒绝 GENERIC_WRITE 打开 → CfConvertToPlaceholder 失败（其余 15 个属性正常故成功） | v0.3.3 `cfapi.ConvertToPlaceholder`：打开前临时清 ReadOnly → 转换 → 无论成败恢复用户属性（单测 `TestConvertToPlaceholderReadonly`） |
+| ⑥ | 换根首轮 `🗑 本地删除 17_旬阳招投标 → delete_cloud`（**险情**） | `local_snap` 是**旧根**的真相，换根不清 → 新根空扫描把旧条目判"本地已删"→ 经 delete_cloud 传播云端；**本次云端恰无此目录才没丢数据** | v0.3.3 `migrateSyncRoot` 换根时 `ResetLocalSnap()`（本地快照清空 + 基线复位，**云端快照保留**防整盘重下/防同名冲突）；v0.3.4 再补**同路径重建**守卫：同步根里放 `.onerclone-root` 标识，`ensureRootMarker` 发现缺失（根被新建/整删后被 cmdRun 的 MkdirAll 静默重建/清空）→ 同样复位；标识文件由 `localFS.Scan` 跳过不同步（坑 #27） |
+
+- **坑 #27** = 换根/重建根的快照传播（路径相同 ≠ 同一块数据）；**坑 #28** = 只读文件收尾失败。
+- **坏占位符处置更新（重启失败）**：重启**没**修好 —— 0x8007016B 依旧（同步根保持注销、
+  tmp_fixdel 仍被拦）。剩余选项：① 管理员 `chkdsk D: /f` → 重启 → 删；
+  ② 安全模式删除（cldflt 未加载 → OPEN_REPARSE_POINT + FSCTL 可剥 tag）；
+  ③ 不管它（已换根，`D:\OnercloneSpike` 不再被任何东西同步，惰性残留）。
+- **用户侧状态**：config `sync_root=D:\Onerclone` 但该目录随后被用户删除 →
+  v0.3.4 启动会 MkdirAll 重建 + 标识守卫复位（**不会再清云端**），但需用户把
+  文件夹拷回（或面板改根）；云端 `qmt/` 3 个文件当前无本地对应（云端快照保留
+  故不会自动下载回来，想要就手动拷回再同步）。
+- 遗留：15:12 实例退出后孤儿 `rclone rcd`（PID 15924，非提权 shell 杀不掉：
+  拒绝访问/疑似安全软件保护）；无害（rcd 独立随机端口），管理员
+  `taskkill /F /PID 15924` 可清；v0.3.4 部署 = `D:\Tools\onerclone\onerclone.exe`。
+
+

@@ -430,13 +430,30 @@ func SetInSync(path string) error {
 // handleFetchData 之外的场景：本地新建文件上传成功后调用，一步完成
 // 转换 + in-sync 标记（CF_CONVERT_FLAG_MARK_IN_SYNC）。
 // FileIdentity 可选，故传 nil/0（后续 CfUpdatePlaceholder 可再补）。
+//
+// 只读属性文件（用户从只读源拷贝，v0.3.2 实测 3/18 这样）：Windows 对
+// FILE_ATTRIBUTE_READONLY 的文件拒绝 GENERIC_WRITE 打开（ERROR_ACCESS_DENIED
+// = "open for convert: Access is denied"）。这里临时清掉 ReadOnly → 转换 →
+// 无论成败都恢复用户原有的属性（不静默改变用户文件属性）。
 func ConvertToPlaceholder(path string, flags uint32) error {
+	const attrReadOnly uint32 = 0x1
 	p := utf16ptr(path)
+
+	origAttr, attrErr := syscall.GetFileAttributes(p)
+	readonly := attrErr == nil && origAttr&attrReadOnly != 0
+	if readonly {
+		if err := syscall.SetFileAttributes(p, origAttr&^attrReadOnly); err != nil {
+			return fmt.Errorf("cfapi: clear readonly for convert: %w", err)
+		}
+	}
 	// 转换需要通用写权限（与 CreateFile 的属性级访问不同）
 	h, err := syscall.CreateFile(p,
 		syscall.GENERIC_READ|syscall.GENERIC_WRITE,
 		fileShareAll, nil, openExisting, 0, 0)
 	if err != nil {
+		if readonly {
+			_ = syscall.SetFileAttributes(p, origAttr) // 打开失败也要把只读还回去
+		}
 		return fmt.Errorf("cfapi: open for convert: %w", err)
 	}
 	defer syscall.CloseHandle(h)
@@ -448,6 +465,9 @@ func ConvertToPlaceholder(path string, flags uint32) error {
 		0, // ConvertUsn = NULL
 		0, // Overlapped = NULL
 	)
+	if readonly {
+		_ = syscall.SetFileAttributes(p, origAttr) // 恢复只读（占位符上同样有效）
+	}
 	runtime.KeepAlive(p)
 	return hr(r1)
 }

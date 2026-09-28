@@ -256,6 +256,19 @@ func (s *Store) ResetCloudSnap() error {
 	return err
 }
 
+// ResetLocalSnap 清空本地快照并重置基线（**换同步根**时调用，踩坑 #27：
+// local_snap 是"旧根磁盘上有什么"的真相 —— 换根后新根若还没拷入文件，
+// 空扫描会把旧条目判成"本地已删"→ 经 delete_cloud 传播到云端；基线一并
+// 复位让 DR2 重新建立保护。cloud_snap 保留：云端与根无关，保留可避免
+// 整盘重新下载、避免与云端现状对不上）。
+func (s *Store) ResetLocalSnap() error {
+	if _, err := s.db.Exec(`DELETE FROM local_snap`); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`DELETE FROM meta WHERE k='baseline_done'`)
+	return err
+}
+
 // ---------- 队列 ----------
 
 // Enqueue 入队（幂等：同 path+kind 合并重置为 pending；仅 inflight 不动——

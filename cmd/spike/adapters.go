@@ -52,8 +52,12 @@ func convergeNames(root string, nm *nameMap) {
 			if err != nil {
 				continue
 			}
+			slashed := filepath.ToSlash(rel)
+			if slashed == rootMarkerName {
+				continue // 同步根身份标识，不同步
+			}
 			// 引擎键（=云端名）：父段此时已收敛，engSeg 就是本段的映射结果
-			eng := nm.ensureUploadable(filepath.ToSlash(rel))
+			eng := nm.ensureUploadable(slashed)
 			engSeg := eng
 			if i := strings.LastIndexByte(eng, '/'); i >= 0 {
 				engSeg = eng[i+1:]
@@ -185,6 +189,9 @@ func (l *localFS) Scan() ([]engine.CloudEntry, error) {
 		rel, err := filepath.Rel(root, p)
 		if err != nil {
 			return nil
+		}
+		if filepath.ToSlash(rel) == rootMarkerName {
+			return nil // 同步根身份标识文件，不参与同步
 		}
 		// 本地名 → 云端原名（映射表反向还原）：engine 的键永远是云端名，
 		// 这样云端 `来自:分享` 与本地 `来自：分享` 在快照/队列里是同一条。

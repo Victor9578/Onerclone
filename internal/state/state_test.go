@@ -58,6 +58,35 @@ func TestSnapshotUpsertAndTombstone(t *testing.T) {
 	}
 }
 
+// TestResetLocalSnap 换同步根复位（踩坑 #27）：本地快照清空 + 基线复位
+//（否则新根空扫描把旧条目判"本地已删"→ delete_cloud 传到云端），
+// 云端快照保留（云端与根无关，保留避免整盘重新下载）。
+func TestResetLocalSnap(t *testing.T) {
+	s := openTest(t)
+	if err := s.PutSnap("local_snap", FileSnap{Path: "old/a.txt", Size: 1, MTime: time.Unix(1, 0), Present: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutSnap("cloud_snap", FileSnap{Path: "qmt/b.txt", Size: 2, MTime: time.Unix(2, 0), Present: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetBaselineDone(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.ResetLocalSnap(); err != nil {
+		t.Fatal(err)
+	}
+	if all, _ := s.AllSnap("local_snap"); len(all) != 0 {
+		t.Fatalf("local_snap 应清空: %v", all)
+	}
+	if all, _ := s.AllSnap("cloud_snap"); len(all) != 1 {
+		t.Fatalf("cloud_snap 应保留: %v", all)
+	}
+	if done, _ := s.BaselineDone(); done {
+		t.Fatal("基线应复位")
+	}
+}
+
 func TestEnqueueIdempotentAndInflightStays(t *testing.T) {
 	s := openTest(t)
 	// 两次入队合并为一条

@@ -206,6 +206,28 @@ run 的 flag（均覆盖配置）:
 
 // ---------- register / unregister ----------
 
+// rootMarkerName 是放进同步根的身份标识文件（localFS.Scan 跳过它，不同步）。
+const rootMarkerName = ".onerclone-root"
+
+// ensureRootMarker 踩坑 #27 的另一半：标识文件在 = 这个根还是我们认识的
+// 那块数据；缺失（根被新建/整删重建/清空过）→ 清空本地快照 + 重置基线
+// （cloud_snap 保留：云端与根无关，保留可避免换根后的同名文件被误判冲突）。
+// 幂等：复位成功后写入标识，后续启动不再触发。
+func ensureRootMarker(root string, st *state.Store) error {
+	p := filepath.Join(root, rootMarkerName)
+	if _, err := os.Stat(p); err == nil {
+		return nil
+	}
+	if err := st.ResetLocalSnap(); err != nil {
+		return fmt.Errorf("复位本地快照: %w", err)
+	}
+	log.Print("🧹 同步根标识缺失（根是新建/重建的）：已清空本地快照并重置基线（DR2 重新保护；云端快照保留）")
+	if err := os.WriteFile(p, []byte("onerclone sync root marker\n"), 0o644); err != nil {
+		return fmt.Errorf("写标识文件: %w", err)
+	}
+	return nil
+}
+
 func isElevated() bool {
 	const tokenElevationClass = 20 // TokenElevation
 	advapi := syscall.NewLazyDLL("advapi32.dll")
@@ -448,6 +470,15 @@ func cmdRun(args []string) {
 		log.Printf("⚠ 写 remote 指纹失败: %v", err)
 	}
 
+	// 同步根标识（踩坑 #27）：路径相同 ≠ 同一块数据 —— 用户删掉整个根后
+	// cmdRun 的 MkdirAll 会静默重建空目录，此时 local_snap 还是旧根的真相
+	// → 空扫描把全部条目判"本地已删"→ delete_cloud 清空云端（今天 15:12
+	// 换根已险些发生一次）。标识文件缺失（新建/重建/清空过根）就复位
+	// 本地快照 + 基线，让 DR2 在重建基线期间挡住一切删除。
+	if err := ensureRootMarker(a.syncRoot, a.store); err != nil {
+		log.Printf("⚠ 同步根标识检查失败: %v", err)
+	}
+
 	// 云端名↔本地名 映射表（从 meta 恢复上次的改名记录）
 	a.nm = newNameMap(a.store)
 	cloud.nm = a.nm
@@ -627,6 +658,16 @@ func migrateSyncRoot(newRoot string) error {
 		}
 	} else {
 		log.Printf("🔄 同步根变更: %s → %s（旧根已非本 provider 注册，跳过注销）", last, newRoot)
+	}
+	// 换根必须复位本地快照 + 基线（踩坑 #27）：local_snap 是"旧根磁盘上
+	// 有什么"的真相 —— 不清则新根（还没拷入文件）的空扫描把旧条目判成
+	// "本地已删"→ 经 delete_cloud 传播到云端。今天实测：换根首轮就入队了
+	// delete_cloud 17_旬阳招投标，恰好云端已无此目录才没丢数据。
+	// cloud_snap 保留：云端与根无关，保留避免整盘重新下载。
+	if err := st.ResetLocalSnap(); err != nil {
+		log.Printf("⚠ 换根复位本地快照失败: %v", err)
+	} else {
+		log.Printf("🧹 换根复位：已清空本地快照并重置基线（DR2 重新保护；云端快照保留）")
 	}
 	_ = st.SetMeta("registered_root", newRoot)
 	return nil
