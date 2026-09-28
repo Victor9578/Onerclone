@@ -587,6 +587,13 @@ cd D:\0Code\Onerclone
   tmp_fixdel 仍被拦）。剩余选项：① 管理员 `chkdsk D: /f` → 重启 → 删；
   ② 安全模式删除（cldflt 未加载 → OPEN_REPARSE_POINT + FSCTL 可剥 tag）；
   ③ 不管它（已换根，`D:\OnercloneSpike` 不再被任何东西同步，惰性残留）。
+  **第三轮验证（15:44/15:50）**：②上位 —— 管理员 chkdsk 真跑了（读/写模式、
+  14679 个重解析记录全过）但结论"**没有发现问题**"：NTFS 结构完好，坏的是
+  reparse 标记**内容**（cldflt 语义层），chkdsk 不管这层 → 死路；同刻再次
+  `unregister -root D:\OnercloneSpike`（root 属性 0x430→0x30 已注销）后 6 文件
+  **仍全 363、fixdel 仍被拦** —— 第二次证明"注册论"不成立（cldflt 按文件自身
+  的 reparse 标记拦截，与同步根注册无关）。主推安全模式：已预编译
+  `D:\Tools\onerclone\fixdel.exe`（逐个剥 tag 后普通删除即可）。
 - **用户侧状态**：config `sync_root=D:\Onerclone` 但该目录随后被用户删除 →
   v0.3.4 启动会 MkdirAll 重建 + 标识守卫复位（**不会再清云端**），但需用户把
   文件夹拷回（或面板改根）；云端 `qmt/` 3 个文件当前无本地对应（云端快照保留
