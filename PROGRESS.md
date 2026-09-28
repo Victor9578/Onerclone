@@ -594,6 +594,12 @@ cd D:\0Code\Onerclone
   **仍全 363、fixdel 仍被拦** —— 第二次证明"注册论"不成立（cldflt 按文件自身
   的 reparse 标记拦截，与同步根注册无关）。主推安全模式：已预编译
   `D:\Tools\onerclone\fixdel.exe`（逐个剥 tag 后普通删除即可）。
+  **✅ 终局（16 时用户实操）：第一档一次成功** —— 管理员 `fltmc unload cldflt`
+  （免重启卸载过滤器）→ 逐个 `fixdel.exe` 剥 tag → `Remove-Item -Recurse`，
+  `D:\OnercloneSpike` 整目录删净 ✓（同轮还复测排除了 `\\?\`+OPEN_REPARSE，
+  仍 363 —— 用户态绕过过滤器的所有路径至此全部证伪）。**处置口径定稿**：
+  这层拦截只有两条物理途径 —— "卸载/禁用 cldflt"（首选 `fltmc unload`，
+  秒级免重启、重启自动恢复）或"驱动不在场的环境"（安全模式/WinRE）。
 - **用户侧状态**：config `sync_root=D:\Onerclone` 但该目录随后被用户删除 →
   v0.3.4 启动会 MkdirAll 重建 + 标识守卫复位（**不会再清云端**），但需用户把
   文件夹拷回（或面板改根）；云端 `qmt/` 3 个文件当前无本地对应（云端快照保留
