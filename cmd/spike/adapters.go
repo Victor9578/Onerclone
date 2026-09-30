@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 // adapters.go 鈥斺€?engine.Cloud / engine.Local 鐨勭湡瀹炵幇锛坮clone RC + cfapi锛夈€?
 //
@@ -9,9 +9,11 @@ import (
 	"io"
 	"log"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 
 	"onerclone/internal/cfapi"
 	"onerclone/internal/engine"
@@ -93,8 +95,8 @@ func convergeNames(root string, nm *nameMap) {
 type cloudRC struct {
 	rc    atomic.Pointer[rclone.Client]
 	nm    *nameMap // Poll 时登记云端字面名（namemap 碰撞判定），nil 安全
-	srcFs string // 鏈湴鍚屾鏍癸紙rclone 浠?local 鍚庣璇诲畠锛?
-	dstFs string // 浜戠 fs锛圥0=鏈湴鏇胯韩鐩綍锛汸1=quark remote锛?
+	srcFs string   // 鏈湴鍚屾鏍癸紙rclone 浠?local 鍚庣璇诲畠锛?
+	dstFs string   // 浜戠 fs锛圥0=鏈湴鏇胯韩鐩綍锛汸1=quark remote锛?
 }
 
 // SetClient 鐑浛鎹?RC 瀹㈡埛绔紙rcd 鑷姩閲嶅惎鍚庤皟鐢級銆?
@@ -110,6 +112,25 @@ func (c *cloudRC) List() ([]engine.CloudEntry, error) {
 	out := make([]engine.CloudEntry, 0, len(entries))
 	for _, e := range entries {
 		c.nm.observeCloud(e.Path) // 每次 Poll 刷新云端字面名（namemap 碰撞判定）
+		out = append(out, engine.CloudEntry{
+			Path:  e.Path,
+			Size:  e.Size,
+			MTime: e.ModTime,
+			IsDir: e.IsDir,
+		})
+	}
+	return out, nil
+}
+
+// ListDir 递归列举 rel 目录下全部条目（不含自身；目录删除前整树复查用）。
+func (c *cloudRC) ListDir(rel string) ([]engine.CloudEntry, error) {
+	entries, err := c.client().ListRecursive(c.dstFs, rel)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]engine.CloudEntry, 0, len(entries))
+	for _, e := range entries {
+		c.nm.observeCloud(e.Path)
 		out = append(out, engine.CloudEntry{
 			Path:  e.Path,
 			Size:  e.Size,
@@ -165,12 +186,15 @@ func (c *cloudRC) Mkdir(rel string) error {
 
 // localFS 鎶婂悓姝ユ牴 + cfapi 鍖呰鎴?engine.Local銆?
 type localFS struct {
-	nm *nameMap // 浜戠绔为目标：云端名↔本地名 映射（DR4 方案 A），nil=不映射
-	root string // 鍚屾鏍圭粷瀵硅矾寰?
+	nm   *nameMap // 浜戠绔为目标：云端名↔本地名 映射（DR4 方案 A），nil=不映射
+	root string   // 鍚屾鏍圭粷瀵硅矾寰?
 }
 
 // Scan 鍏ㄩ噺鎵弿鍚屾鏍癸紙鍚崰浣嶇鈥斺€攐s.Stat 瀵瑰崰浣嶇杩斿洖姝ｇ‘鐨?size/mtime锛?
 // P0 宸查獙璇侊紱ModeIrregular 涓嶅奖鍝嶆湰鐢ㄩ€旓級銆?
+// tmpSuffix 是 ApplyDownload 原子替换用的临时后缀（Scan 跳过并清理残留）。
+const tmpSuffix = ".onerclone-tmp"
+
 func (l *localFS) Scan() ([]engine.CloudEntry, error) {
 	// 先收敛物理名：rclone 读不到的全角名（：？＜＞…）改名成引擎键（踩坑 #26），
 	// 否则本轮 upload 源侧 copyfile 必 404。改名在 walk 之前自顶向下完成，
@@ -192,6 +216,11 @@ func (l *localFS) Scan() ([]engine.CloudEntry, error) {
 		}
 		if filepath.ToSlash(rel) == rootMarkerName {
 			return nil // 同步根身份标识文件，不参与同步
+		}
+		if strings.HasSuffix(p, tmpSuffix) {
+			// ApplyDownload 原子替换的崩溃残留（半成品占位符），无数据，顺手清掉
+			_ = os.Remove(p)
+			return nil
 		}
 		// 本地名 → 云端原名（映射表反向还原）：engine 的键永远是云端名，
 		// 这样云端 `来自:分享` 与本地 `来自：分享` 在快照/队列里是同一条。
@@ -238,23 +267,56 @@ func (l *localFS) Stat(rel string) (*engine.CloudEntry, error) {
 func (l *localFS) ApplyDownload(rel string, e engine.CloudEntry) error {
 	abs := l.path(rel)
 	if e.IsDir {
-		return os.MkdirAll(abs, 0o755)
+		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+			return err
+		}
+		results, err := cfapi.CreatePlaceholders(filepath.Dir(abs), []cfapi.NewPlaceholder{{
+			RelativeFileName: filepath.Base(abs),
+			FileSize:         0,
+			ModTime:          e.MTime,
+			Flags:            cfapi.PlaceholderCreateFlagMarkInSync,
+			Identity:         []byte(rel),
+			IsDir:            true,
+		}})
+		if err != nil {
+			if code, _ := cfapi.AsHRESULT(err); code == hrNotSyncRoot {
+				// 单测/未注册根的兜底：普通目录仍可同步，只是没有状态图标。
+				return os.MkdirAll(abs, 0o755)
+			}
+			if code, _ := cfapi.AsHRESULT(err); code == hrAlreadyExists {
+				return l.FinalizeUpload(rel)
+			}
+			return fmt.Errorf("建目录占位符 %s: %w", rel, err)
+		}
+		for _, hr := range results {
+			if hr != 0 {
+				if uint32(hr) == hrAlreadyExists {
+					return l.FinalizeUpload(rel)
+				}
+				return fmt.Errorf("建目录占位符 %s: HRESULT 0x%08X", rel, uint32(hr))
+			}
+		}
+		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		return err
 	}
 	// 宸插瓨鍦?鈫?鍏堝垹锛堟湰鍦版湭淇敼鏄紩鎿庝繚璇佺殑鍓嶆彁锛屽垹闄ゆ棤鏁版嵁鎹熷け锛?
+	// 已存在 → 先在旁边建好新占位符，再原子 rename 替换。
+	// 旧做法先 os.Remove 后重建：删完、快照落地前崩溃 → 下轮 Scan 判
+	// “本地已删” → 删云端 → 双侧全丢。同卷 rename 原子替换，无空窗。
+	// ponytail: 崩溃残留的 *.onerclone-tmp 由 Scan 顺手清理。
+	name := filepath.Base(abs)
 	if _, err := os.Lstat(abs); err == nil {
-		if err := os.Remove(abs); err != nil {
-			return fmt.Errorf("鍒犻櫎鏃ф枃浠?%s: %w", rel, err)
-		}
+		name += tmpSuffix
+		_ = os.Remove(filepath.Join(filepath.Dir(abs), name))
 	}
 	results, err := cfapi.CreatePlaceholders(filepath.Dir(abs), []cfapi.NewPlaceholder{{
-		RelativeFileName: filepath.Base(abs),
-		FileSize:          e.Size,
-		ModTime:           e.MTime,
-		Flags:             cfapi.PlaceholderCreateFlagMarkInSync,
-		Identity:          []byte(rel),
+		RelativeFileName: name,
+		FileSize:         e.Size,
+		ModTime:          e.MTime,
+		Flags:            cfapi.PlaceholderCreateFlagMarkInSync,
+		Identity:         []byte(rel),
 	}})
 	if err != nil {
 		if code, _ := cfapi.AsHRESULT(err); code == hrAlreadyExists {
@@ -265,6 +327,11 @@ func (l *localFS) ApplyDownload(rel string, e engine.CloudEntry) error {
 	for _, hr := range results {
 		if hr != 0 && uint32(hr) != hrAlreadyExists {
 			return fmt.Errorf("寤哄崰浣嶇 %s: HRESULT 0x%08X", rel, uint32(hr))
+		}
+	}
+	if name != filepath.Base(abs) {
+		if err := os.Rename(filepath.Join(filepath.Dir(abs), name), abs); err != nil {
+			return fmt.Errorf("替换旧文件 %s: %w", rel, err)
 		}
 	}
 	return nil
@@ -299,16 +366,39 @@ func (l *localFS) FinalizeUpload(rel string) error {
 	return cfapi.ConvertToPlaceholder(abs, cfapi.ConvertFlagMarkInSync)
 }
 
-// WasHydrated 鍒ゆ柇姝ゅ墠鏄惁宸叉按鍚堬紙Q6锛夈€?
-// P1 绠€鍖栵細鍙鏈湴鏇炬槸鍗犱綅绗︿笖 size>0 鍗宠涓哄彲鑳藉凡姘村悎鈥斺€?
-// ApplyDownload 璧版噿姘村悎锛堣鏃舵媺鏈€鏂帮級锛屼富鍔ㄩ噸鎷夌暀寰?Q6 瀹屾暣瀹炵幇銆?
+// WasHydrated 判断此前是否已水合（Q6：曾水合的自动重新下载）。
+// 占位符的 size 恒为云端大小（size>0 不能当水合证据——v0.3.6 用它把懒水合
+// 击穿过：云端每改一个文件就全量重拉）。正确证据是占位符属性：
+// FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS（0x400000）置位 = 脱水占位符。
 func (l *localFS) WasHydrated(rel string) bool {
-	abs := l.path(rel)
-	st, err := os.Lstat(abs)
-	if err != nil {
+	fi, err := os.Lstat(l.path(rel))
+	if err != nil || fi.IsDir() {
 		return false
 	}
-	return !st.IsDir() && st.Size() > 0
+	if d, ok := fi.Sys().(*syscall.Win32FileAttributeData); ok {
+		return d.FileAttributes&0x400000 == 0 // 无 RECALL 位 = 已水合/普通文件
+	}
+	return fi.Size() > 0
+}
+func (l *localFS) MarkSyncing(rel string) {
+	for p := rel; p != "." && p != "/" && p != ""; p = path.Dir(p) {
+		abs := l.path(p)
+		if _, err := os.Lstat(abs); err != nil {
+			continue
+		}
+		_ = cfapi.SetNotInSync(abs)
+	}
+}
+
+// MarkSynced 把条目标回 in-sync（绿勾）。仅在该路径无未完成动作时由引擎
+// 调用；祖先目录不在这里恢复——目录绿勾由 RestoreInSync/全量对账统一裁决，
+// 避免目录先于子文件变绿（v0.3.6 实测的乱显示根因）。
+func (l *localFS) MarkSynced(rel string) {
+	abs := l.path(rel)
+	if _, err := os.Lstat(abs); err != nil {
+		return
+	}
+	_ = cfapi.SetInSync(abs)
 }
 
 // path 云端原名（engine 的键）→ 同步根下的本地绝对路径：先经 namemap

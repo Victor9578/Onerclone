@@ -72,8 +72,6 @@ type app struct {
 	pollKick chan struct{}
 
 	// watcher 触发全量扫描的节流（引擎自身有 mu，这里防扫描风暴）
-	scanMu      sync.Mutex
-	scanPending *time.Timer
 }
 
 func defaultRoot() string {
@@ -118,11 +116,8 @@ func printVersion() {
 	fmt.Printf("onerclone %s (build %s)\n", version, buildDate)
 }
 
-// panelURL 是当前面板一次性链接（托盘“打开面板”用；每次启动换新）。
-var panelURL atomic.Value
-
 // trayQuit 由托盘“退出”菜单触发（与 Ctrl+C 等价）。
-var trayQuit = make(chan struct{})
+var trayQuit = make(chan struct{}, 1) // 缓冲 1：cmdRun 未就绪时托盘退出也不丢
 
 // logFilePath 是当前日志路径（托盘“打开日志”用）。
 var logFilePath atomic.Value
@@ -369,6 +364,8 @@ func cmdRun(args []string) {
 	}
 	var curDaemon atomic.Pointer[rclone.Daemon]
 	curDaemon.Store(daemon)
+	rcdDone := make(chan struct{})
+	defer close(rcdDone) // 先于下面的 Stop 执行（LIFO）：停掉监控免重启孤儿
 	defer func() { // 闭包捕获 holder（直接 defer daemon.Stop 会绑定旧实例）
 		if d := curDaemon.Load(); d != nil {
 			d.Stop()
@@ -382,12 +379,21 @@ func cmdRun(args []string) {
 	go func() {
 		for {
 			d := curDaemon.Load()
-			err := <-d.Exited
+			var err error
+			select {
+			case <-rcdDone:
+				return // 应用退出：不再重启，避免孤儿 rcd
+			case err = <-d.Exited:
+			}
 			log.Printf("✗ rclone rcd 退出: %v，5s 后自动重启\n--- 输出 ---\n%s",
 				err, trimOutput(d.Output()))
 			backoff := 5 * time.Second
 			for {
-				time.Sleep(backoff)
+				select {
+				case <-rcdDone:
+					return
+				case <-time.After(backoff):
+				}
 				if backoff < 30*time.Second {
 					backoff *= 2
 				}
@@ -395,6 +401,13 @@ func cmdRun(args []string) {
 				if err != nil {
 					log.Printf("⚠ rcd 重启失败（%v），退避后重试", err)
 					continue
+				}
+				// 重启成功瞬间应用退出：立即停掉新进程，不留孤儿
+				select {
+				case <-rcdDone:
+					nd.Stop()
+					return
+				default:
 				}
 				curDaemon.Store(nd)
 				a.rc.Store(nd.Client)
@@ -427,7 +440,13 @@ func cmdRun(args []string) {
 	if err != nil {
 		log.Fatalf("CfConnectSyncRoot 失败（同步根未注册？先跑 register）: %v", err)
 	}
-	defer a.session.Disconnect()
+	if err := a.session.UpdateProviderStatus(cfapi.ProviderStatusIdle); err != nil {
+		log.Printf("⚠ 上报 provider IDLE 失败（Explorer 可能显示同步中）: %v", err)
+	}
+	defer func() {
+		_ = a.session.UpdateProviderStatus(cfapi.ProviderStatusDisconnected)
+		_ = a.session.Disconnect()
+	}()
 	log.Print("同步根已连接（FETCH_DATA 回调在线）")
 
 	// 4.5) Shell 集成自动补注册（v0.2.0 用户反馈问题①）：CfRegisterSyncRoot
@@ -438,6 +457,10 @@ func cmdRun(args []string) {
 		log.Printf("⚠ Shell 注册失败（状态图标将不显示，同步不受影响）: %v", err)
 	} else {
 		log.Print("✅ Shell 注册成功（SyncRootManager ✓ 状态图标已启用）")
+	}
+	// 同步根本身也标记 in-sync，避免 Explorer 把根目录一直显示成“同步中”。
+	if err := cfapi.SetInSync(a.syncRoot); err != nil {
+		log.Printf("⚠ 标记同步根 in-sync 失败: %v", err)
 	}
 
 	// 5) 打开 P1 状态库 + 建引擎（三库模型：local_snap/cloud_snap/queue）
@@ -487,22 +510,13 @@ func cmdRun(args []string) {
 		cloud,
 		&localFS{root: a.syncRoot, nm: a.nm}, log.Default())
 
-	// 5.5) 本地 Web 面板（Phase 2 Q8/Q14：一次性 token + embed 单页 + 管理动作）
-	if pn, err := startPanel(a.store, a.eng, a.syncRoot, a.fsRoot, a.offline); err != nil {
-		log.Printf("⚠ 本地面板启动失败（不影响同步）: %v", err)
-	} else {
-		defer pn.Close()
-		panelURL.Store(pn.URL())
-		log.Printf("🌐 本地面板（一次性链接，重启失效）: %s", pn.URL())
-	}
-
-	// 托盘常驻（Phase 2）：失败/无交互桌面只影响图标，不影响同步
+	// 托盘常驻（Phase 2）：网页面板从运行路径移除，登录走 CLI，状态走 Explorer。
 	trayRoot.Store(a.syncRoot)
 	if v, ok := logFilePath.Load().(string); ok {
 		trayLog.Store(v)
 	}
 	startTray()
-	log.Print("📌 托盘已启动：打开面板 / 同步根 / 日志 / 退出（右键图标）")
+	log.Print("📌 托盘已启动：同步根 / 日志 / 退出（右键图标）")
 
 	// 6) 首轮基线：本地扫描 + 云端轮询 → 建立三库快照（DR2 之前无删除）
 	if n, err := a.eng.Scan(); err != nil {
@@ -519,6 +533,11 @@ func cmdRun(args []string) {
 		}
 	} else {
 		log.Printf("首轮云端轮询：入队 %d", n)
+		if restored, err := a.eng.RestoreInSync(); err != nil {
+			log.Printf("⚠ 恢复 in-sync 状态失败: %v", err)
+		} else if restored > 0 {
+			log.Printf("✅ 启动时恢复 %d 个文件的绿勾状态", restored)
+		}
 	}
 
 	// 7) 引擎执行器（动作队列 worker，崩溃残留自动回收）
@@ -591,41 +610,6 @@ func statePath() string {
 // 对非同步根路径的返回；ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT）。
 const hrNotSyncRoot = 0x80070186
 
-// checkNTFS 校验路径所在卷是 NTFS（cfapi 硬约束：仅 NTFS 支持 Cloud Files）。
-func checkNTFS(path string) error {
-	if vol := filepath.VolumeName(path); vol != "" {
-		if fs, err := getVolumeFS(vol); err == nil && !strings.EqualFold(fs, "NTFS") {
-			return fmt.Errorf("%s 是 %s 卷（cfapi 仅支持 NTFS）", vol, fs)
-		}
-	}
-	return nil
-}
-
-// getVolumeFS 返回卷的文件系统名（如 NTFS / ReFS / FAT32）。
-func getVolumeFS(vol string) (string, error) {
-	// GetVolumeInformationW：根路径必须以 \ 结尾
-	root := vol
-	if !strings.HasSuffix(root, `\`) {
-		root += `\`
-	}
-	p, err := syscall.UTF16PtrFromString(root)
-	if err != nil {
-		return "", err
-	}
-	var fsName [32]uint16
-	kernel32 := syscall.NewLazyDLL("kernel32.dll")
-	r1, _, e := kernel32.NewProc("GetVolumeInformationW").Call(
-		uintptr(unsafe.Pointer(p)),
-		0, 0, 0, 0,
-		uintptr(unsafe.Pointer(&fsName[0])),
-		uintptr(len(fsName)),
-	)
-	if r1 == 0 {
-		return "", e
-	}
-	return syscall.UTF16ToString(fsName[:]), nil
-}
-
 // migrateSyncRoot 换根迁移（v0.2.0 反馈问题②）：配置的根若不是本
 // provider 注册的同步根，自动注销旧根（内核 + Shell 层）再让调用方注册
 // 新根。旧根不存在/已注销的报错一律忽略（幂等）。
@@ -690,17 +674,25 @@ func (a *app) handleFetchData(info *cfapi.CallbackInfo, params *cfapi.CallbackPa
 	reqLen := fd.RequiredLength
 	size := info.FileSize
 
+	// 用当前活跃会话而非 a.session：Connect 返回前回调就可能触发，
+// a.session 尚未赋值（nil 解引用被 recover 吞掉 → I/O 挂 60s）。
+	s := cfapi.ActiveSession()
+	if s == nil {
+		log.Printf("✗ FETCH_DATA 无活跃会话，丢弃（CF 会重试水合）")
+		return
+	}
+
 	// —— 离线：立即快速失败（开放事实②验证点）——
 	if a.offline {
 		log.Printf("⊘ [offline] 读取 %s [%d,+%d) → 立即返回 NETWORK_UNAVAILABLE", base, off, reqLen)
-		if err := a.session.FailTransfer(info, off, reqLen, cfapi.StatusCloudFileNetworkUnavailable); err != nil {
+		if err := s.FailTransfer(info, off, reqLen, cfapi.StatusCloudFileNetworkUnavailable); err != nil {
 			log.Printf("✗ 快速失败响应出错: %v", err)
 		}
 		return
 	}
 
 	if off >= size {
-		_ = a.session.FailTransfer(info, off, reqLen, cfapi.StatusEndOfFile)
+		_ = s.FailTransfer(info, off, reqLen, cfapi.StatusEndOfFile)
 		return
 	}
 	end := off + reqLen
@@ -711,7 +703,7 @@ func (a *app) handleFetchData(info *cfapi.CallbackInfo, params *cfapi.CallbackPa
 	rel, err := a.rel(path)
 	if err != nil {
 		log.Printf("✗ 路径越界 %s: %v", base, err)
-		_ = a.session.FailTransfer(info, off, reqLen, cfapi.StatusCloudFileNetworkUnavailable)
+		_ = s.FailTransfer(info, off, reqLen, cfapi.StatusCloudFileNetworkUnavailable)
 		return
 	}
 
@@ -723,15 +715,15 @@ func (a *app) handleFetchData(info *cfapi.CallbackInfo, params *cfapi.CallbackPa
 	data, err := a.rc.Load().RangeGet(a.fsRoot, rel, off, end)
 	if err != nil {
 		log.Printf("✗ 取数失败 %s: %v", base, err)
-		_ = a.session.FailTransfer(info, off, reqLen, cfapi.StatusCloudFileNetworkUnavailable)
+		_ = s.FailTransfer(info, off, reqLen, cfapi.StatusCloudFileNetworkUnavailable)
 		return
 	}
 	if int64(len(data)) != end-off {
 		log.Printf("✗ 取数长度不符 %s: want=%d got=%d", base, end-off, len(data))
-		_ = a.session.FailTransfer(info, off, reqLen, cfapi.StatusCloudFileNetworkUnavailable)
+		_ = s.FailTransfer(info, off, reqLen, cfapi.StatusCloudFileNetworkUnavailable)
 		return
 	}
-	if err := a.session.TransferData(info, off, int64(len(data)), data); err != nil {
+	if err := s.TransferData(info, off, int64(len(data)), data); err != nil {
 		log.Printf("✗ 回填失败 %s: %v", base, err)
 		return
 	}
@@ -814,7 +806,9 @@ func (a *app) startWatcher() (*fsnotify.Watcher, error) {
 				}
 				if ev.Op&fsnotify.Create != 0 {
 					if st, err := os.Stat(ev.Name); err == nil && st.IsDir() {
-						_ = a.addTree(w, ev.Name)
+						// 异步补挂子树：同步 Walk 大树会阻塞事件循环 →
+						// 内核缓冲溢出丢事件（fsnotify.Add 并发安全）
+						go func(name string) { _ = a.addTree(w, name) }(ev.Name)
 					}
 				}
 				schedule(ev.Name)
@@ -867,10 +861,18 @@ func (a *app) pollLoop() {
 		case <-time.After(wait):
 		}
 
-		// 12h 强制全量对账（Q15 兜底）：额外补一轮本地扫描
+		// 12h 强制全量对账（Q15 兜底）：补一轮本地扫描 + 图标恢复
+		//（深层文件同步完但祖先目录未收敛时，平时无人再触发 MarkSynced，
+		// 长跑进程图标会永久停在“同步中”直到重启——v0.3.6 实测现象）
 		if time.Since(lastFull) >= fullRecon {
 			if n, err := a.eng.Scan(); err == nil && n > 0 {
 				log.Printf("🕒 12h 全量对账：本地扫描入队 %d", n)
+			}
+			if r, err := a.eng.RestoreInSync(); err == nil && r > 0 {
+				log.Printf("🕒 12h 全量对账：恢复 %d 个绿钩", r)
+			}
+			if n, err := a.store.GCDone(7 * 24 * time.Hour); err == nil && n > 0 {
+				log.Printf("🕒 12h 全量对账：清理 %d 条已完成动作", n)
 			}
 			lastFull = time.Now()
 		}

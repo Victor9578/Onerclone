@@ -14,11 +14,12 @@ import (
 
 const (
 	// CF_PLACEHOLDER_CREATE_FLAGS
-	PlaceholderCreateFlagNone       uint32 = 0x00000000
-	PlaceholderCreateFlagMarkInSync uint32 = 0x00000002
+	PlaceholderCreateFlagDisableOnDemandPopulation uint32 = 0x00000001
+	PlaceholderCreateFlagNone                      uint32 = 0x00000000
+	PlaceholderCreateFlagMarkInSync                uint32 = 0x00000002
 
 	// CF_CONVERT_FLAGS
-	ConvertFlagNone      uint32 = 0x00000000
+	ConvertFlagNone       uint32 = 0x00000000
 	ConvertFlagMarkInSync uint32 = 0x00000001
 
 	// CF_REGISTER_FLAGS
@@ -26,19 +27,19 @@ const (
 	RegisterFlagUpdate uint32 = 0x00000001
 
 	// CF_CONNECT_FLAGS
-	ConnectFlagNone             uint32 = 0x00000000
-	ConnectFlagRequireProcessInfo uint32 = 0x00000002
+	ConnectFlagNone                uint32 = 0x00000000
+	ConnectFlagRequireProcessInfo  uint32 = 0x00000002
 	ConnectFlagRequireFullFilePath uint32 = 0x00000004
 
 	// CF_CREATE_FLAGS
-	CreateFlagNone       uint32 = 0x00000000
+	CreateFlagNone        uint32 = 0x00000000
 	CreateFlagStopOnError uint32 = 0x00000001
 
 	// CF_HYDRATION_POLICY_PRIMARY
-	HydrationPolicyPartial    uint16 = 0
+	HydrationPolicyPartial     uint16 = 0
 	HydrationPolicyProgressive uint16 = 1
-	HydrationPolicyFull       uint16 = 2
-	HydrationPolicyAlwaysFull uint16 = 3
+	HydrationPolicyFull        uint16 = 2
+	HydrationPolicyAlwaysFull  uint16 = 3
 
 	// CF_POPULATION_POLICY_PRIMARY
 	PopulationPolicyPartial    uint16 = 0
@@ -51,8 +52,8 @@ const (
 	InSyncPolicyTrackAll     uint32 = 0x00ffffff
 
 	// CF_HARDLINK_POLICY
-	HardLinkPolicyNone     uint32 = 0x00000000
-	HardLinkPolicyAllowed  uint32 = 0x00000001
+	HardLinkPolicyNone    uint32 = 0x00000000
+	HardLinkPolicyAllowed uint32 = 0x00000001
 
 	// CF_IN_SYNC_STATE
 	InSyncStateNotInSync uint32 = 0
@@ -62,7 +63,8 @@ const (
 	SetInSyncFlagNone uint32 = 0
 
 	// 文件属性（winnt.h）
-	FileAttributeNormal uint32 = 0x80
+	FileAttributeNormal    uint32 = 0x80
+	FileAttributeDirectory uint32 = 0x10
 
 	// NTSTATUS —— 已在 ntstatus.h 核准（高位码以补码形式表示）
 	StatusEndOfFile                   int32 = -1073741807 // 0xC0000011
@@ -85,20 +87,20 @@ const (
 type CallbackType uint32
 
 const (
-	CallbackTypeFetchData CallbackType = iota // 0
-	CallbackTypeValidateData                  // 1
-	CallbackTypeCancelFetchData               // 2
-	CallbackTypeFetchPlaceholders             // 3
-	CallbackTypeCancelFetchPlaceholders       // 4
-	CallbackTypeNotifyFileOpenCompletion      // 5
-	CallbackTypeNotifyFileCloseCompletion     // 6
-	CallbackTypeNotifyDehydrate               // 7
-	CallbackTypeNotifyDehydrateCompletion     // 8
-	CallbackTypeNotifyDelete                  // 9
-	CallbackTypeNotifyDeleteCompletion        // 10
-	CallbackTypeNotifyRename                  // 11
-	CallbackTypeNotifyRenameCompletion        // 12
-	CallbackTypeNone CallbackType = 0xffffffff
+	CallbackTypeFetchData                 CallbackType = iota // 0
+	CallbackTypeValidateData                                  // 1
+	CallbackTypeCancelFetchData                               // 2
+	CallbackTypeFetchPlaceholders                             // 3
+	CallbackTypeCancelFetchPlaceholders                       // 4
+	CallbackTypeNotifyFileOpenCompletion                      // 5
+	CallbackTypeNotifyFileCloseCompletion                     // 6
+	CallbackTypeNotifyDehydrate                               // 7
+	CallbackTypeNotifyDehydrateCompletion                     // 8
+	CallbackTypeNotifyDelete                                  // 9
+	CallbackTypeNotifyDeleteCompletion                        // 10
+	CallbackTypeNotifyRename                                  // 11
+	CallbackTypeNotifyRenameCompletion                        // 12
+	CallbackTypeNone                      CallbackType = 0xffffffff
 )
 
 // ---------- 结构体（x64 布局，字段顺序不可调整） ----------
@@ -133,16 +135,16 @@ type PlaceholderCreateInfo struct {
 
 // CF_SYNC_REGISTRATION（56 字节）
 type SyncRegistration struct {
-	StructSize            uint32
-	_                     uint32
-	ProviderName          *uint16
-	ProviderVersion       *uint16
-	SyncRootIdentity      unsafe.Pointer // 必须用 unsafe.Pointer：GC 需追踪
+	StructSize             uint32
+	_                      uint32
+	ProviderName           *uint16
+	ProviderVersion        *uint16
+	SyncRootIdentity       unsafe.Pointer // 必须用 unsafe.Pointer：GC 需追踪
 	SyncRootIdentityLength uint32
-	_                     uint32
-	FileIdentity          unsafe.Pointer
-	FileIdentityLength    uint32
-	_                     uint32
+	_                      uint32
+	FileIdentity           unsafe.Pointer
+	FileIdentityLength     uint32
+	_                      uint32
 }
 
 // CF_SYNC_POLICIES（20 字节）
@@ -172,29 +174,29 @@ type CallbackRegistration struct {
 // fileIdent@88, fileIdentLen@96, normPath@104, transferKey@112,
 // prio@120, corrVec@128, procInfo@136
 type CallbackInfo struct {
-	StructSize            uint32
-	_                     uint32
-	ConnectionKey         uint64
-	CallbackContext       uintptr
-	VolumeGuidName        *uint16
-	VolumeDosName         *uint16
-	VolumeSerialNumber    uint32
-	_                     uint32
-	SyncRootFileId        int64
-	SyncRootIdentity      uintptr
+	StructSize             uint32
+	_                      uint32
+	ConnectionKey          uint64
+	CallbackContext        uintptr
+	VolumeGuidName         *uint16
+	VolumeDosName          *uint16
+	VolumeSerialNumber     uint32
+	_                      uint32
+	SyncRootFileId         int64
+	SyncRootIdentity       uintptr
 	SyncRootIdentityLength uint32
-	_                     uint32
-	FileId                int64
-	FileSize              int64
-	FileIdentity          uintptr
-	FileIdentityLength    uint32
-	_                     uint32
-	NormalizedPath        *uint16
-	TransferKey           int64
-	PriorityHint          uint8
-	_                     [7]uint8
-	CorrelationVector     uintptr
-	ProcessInfo           uintptr
+	_                      uint32
+	FileId                 int64
+	FileSize               int64
+	FileIdentity           uintptr
+	FileIdentityLength     uint32
+	_                      uint32
+	NormalizedPath         *uint16
+	TransferKey            int64
+	PriorityHint           uint8
+	_                      [7]uint8
+	CorrelationVector      uintptr
+	ProcessInfo            uintptr
 }
 
 // fetchdata 子结构（CF_CALLBACK_PARAMETERS 联合体的 FETCH_DATA 视图）
@@ -244,10 +246,10 @@ func NewRegistration(provider, version string, syncRootIdentity, fileIdentity []
 		StructSize:             uint32(unsafe.Sizeof(SyncRegistration{})),
 		ProviderName:           utf16ptr(provider),
 		ProviderVersion:        utf16ptr(version),
-		SyncRootIdentity:      bytesToPointer(syncRootIdentity),
+		SyncRootIdentity:       bytesToPointer(syncRootIdentity),
 		SyncRootIdentityLength: uint32(len(syncRootIdentity)),
-		FileIdentity:          bytesToPointer(fileIdentity),
-		FileIdentityLength:    uint32(len(fileIdentity)),
+		FileIdentity:           bytesToPointer(fileIdentity),
+		FileIdentityLength:     uint32(len(fileIdentity)),
 	}
 }
 
@@ -261,7 +263,9 @@ func NewPolicies() *SyncPolicies {
 	}
 	p.Hydration.Primary = HydrationPolicyFull
 	p.Population.Primary = PopulationPolicyAlwaysFull
-	p.InSync = InSyncPolicyTrackFileAll
+	// Explorer 的文件夹状态不是由子文件状态自动聚合出来的。若只跟踪文件，
+	// 目录即使 MARK_IN_SYNC 也可能继续显示“同步中”。
+	p.InSync = InSyncPolicyTrackAll
 	p.HardLink = HardLinkPolicyNone
 	return p
 }
@@ -271,10 +275,22 @@ func NewPolicies() *SyncPolicies {
 // 并会在后续所有回调中回传给 provider。
 type NewPlaceholder struct {
 	RelativeFileName string
-	FileSize          int64
-	ModTime           time.Time
-	Flags             uint32
-	Identity          []byte
+	FileSize         int64
+	ModTime          time.Time
+	Flags            uint32
+	Identity         []byte
+	IsDir            bool
+}
+
+// placeholderCreateFlags 补齐目录占位符必需的 population 标志。
+// 目录一律不预标 in-sync（v0.3.6 实测：目录先绿勾会误导 Explorer 状态列，
+// 子文件还在队列里时目录应显示同步中）——绿勾由引擎在动作结算后统一补。
+func placeholderCreateFlags(isDir bool, flags uint32) uint32 {
+	if isDir {
+		flags |= PlaceholderCreateFlagDisableOnDemandPopulation
+		flags &^= PlaceholderCreateFlagMarkInSync
+	}
+	return flags
 }
 
 // FILETIME 转换：Unix 时间 → 自 1601-01-01 起的 100ns 单位。
@@ -292,9 +308,9 @@ func toFiletime(t time.Time) int64 {
 		return 0
 	}
 	const (
-		offsetSec  = int64(11644473600)          // 1601-01-01 → 1970-01-01 的秒数
+		offsetSec  = int64(11644473600) // 1601-01-01 → 1970-01-01 的秒数
 		maxInt64   = int64(1<<63 - 1)
-		maxFTUnits = maxInt64 / 1e7               // 秒级上限（不溢出）
+		maxFTUnits = maxInt64 / 1e7 // 秒级上限（不溢出）
 	)
 	sec := t.Unix()
 	if sec < -offsetSec { // 1601 年之前：无合法表示，退到 0（实测可接受）

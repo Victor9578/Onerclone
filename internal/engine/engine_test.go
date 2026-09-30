@@ -15,8 +15,9 @@ import (
 // ---------- fake 实现 ----------
 
 type fakeCloud struct {
-	mu    map[string]CloudEntry
-	listE error
+	mu      map[string]CloudEntry
+	listE   error
+	uploadE error
 }
 
 func newFakeCloud() *fakeCloud { return &fakeCloud{mu: map[string]CloudEntry{}} }
@@ -40,7 +41,17 @@ func (f *fakeCloud) Stat(rel string) (*CloudEntry, error) {
 	return &e, nil
 }
 
-func (f *fakeCloud) Upload(rel string) error      { return nil }
+func (f *fakeCloud) ListDir(rel string) ([]CloudEntry, error) {
+	out := []CloudEntry{}
+	for _, e := range f.mu {
+		if strings.HasPrefix(e.Path, rel+"/") {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeCloud) Upload(rel string) error { return f.uploadE }
 func (f *fakeCloud) Download(rel string) error    { return nil }
 func (f *fakeCloud) DownloadTo(a, b string) error { return nil }
 func (f *fakeCloud) Delete(rel string) error {
@@ -62,8 +73,11 @@ type fakeLocal struct {
 	mu map[string]CloudEntry
 
 	// Q6：这些路径“曾水合”（读过数据），云端变更后引擎应主动重拉
-	hydrated     map[string]bool
-	hydrateCalls []string
+	hydrated      map[string]bool
+	hydrateCalls  []string
+	finalizeCalls []string
+	syncingCalls  []string
+	syncedCalls   []string
 }
 
 func newFakeLocal() *fakeLocal {
@@ -92,8 +106,17 @@ func (f *fakeLocal) Remove(rel string) error {
 	delete(f.mu, rel)
 	return nil
 }
-func (f *fakeLocal) FinalizeUpload(rel string) error { return nil }
-func (f *fakeLocal) WasHydrated(rel string) bool     { return f.hydrated[rel] }
+func (f *fakeLocal) FinalizeUpload(rel string) error {
+	f.finalizeCalls = append(f.finalizeCalls, rel)
+	return nil
+}
+func (f *fakeLocal) MarkSyncing(rel string) {
+	f.syncingCalls = append(f.syncingCalls, rel)
+}
+func (f *fakeLocal) MarkSynced(rel string) {
+	f.syncedCalls = append(f.syncedCalls, rel)
+}
+func (f *fakeLocal) WasHydrated(rel string) bool { return f.hydrated[rel] }
 func (f *fakeLocal) Hydrate(rel string) error {
 	f.hydrateCalls = append(f.hydrateCalls, rel)
 	return nil
@@ -243,8 +266,12 @@ func TestDeleteLocalGatedByBaseline(t *testing.T) {
 	// 先执行完首轮动作（生产中 worker 会立刻跑；残留 pending upload 会
 	// 让后续 delete_local 的 localChanged 判定走复活分支）
 	drain(t, eng)
-	// 云端删 a → poll 应入队 delete_local（基线已完成）
+	// 云端删 a → poll 应入队 delete_local（基线已完成）。
+	// 空列表护栏：首轮空只记疑，第二轮确认后才入队。
 	delete(fc.mu, "a.txt")
+	if _, err := eng.Poll(); err == nil {
+		t.Fatal("首轮空列表应被护栏拦下")
+	}
 	if n, err := eng.Poll(); err != nil || n != 1 {
 		t.Fatalf("poll n=%d err=%v", n, err)
 	}
@@ -359,7 +386,10 @@ func TestDeleteLocalRevivesWhenLocalChanged(t *testing.T) {
 	}
 	// Poll：云端消失 + 本地本轮变过 → localChanged=true → 走 Q18 复活分支，
 	// upload 幂等重置（Enqueue 对已有 pending 重置也返回 true，n 可为 1），
-	// 关键是**绝不能入队 delete_local**。
+	// 关键是**绝不能入队 delete_local**。首轮空列表被护栏拦下，第二轮确认。
+	if _, err := eng.Poll(); err == nil {
+		t.Fatal("首轮空列表应被护栏拦下")
+	}
 	if _, err := eng.Poll(); err != nil {
 		t.Fatal(err)
 	}
@@ -377,12 +407,250 @@ func TestDeleteLocalRevivesWhenLocalChanged(t *testing.T) {
 		t.Fatalf("upload should complete, stats=%v", stats)
 	}
 }
+
 // TestClassifyCorruptPlaceholder 损坏占位符（踩坑 #24）：cldflt 对一切访问
 // 返回 "cloud file metadata is corrupt"，当轮重试无意义 → 必须归永久失败
-//（此前归 network 类导致每轮重试、日志刷屏）。
+// （此前归 network 类导致每轮重试、日志刷屏）。
 func TestClassifyCorruptPlaceholder(t *testing.T) {
 	err := errors.New(`unlinkat D:\sync\a.pdf: The cloud file metadata is corrupt and unreadable.`)
 	if got := classify(err); got != state.ClassPermanent {
 		t.Fatalf("classify(corrupt) = %s, want permanent", got)
+	}
+}
+
+func TestScanCancelsUploadWhenLocalMissing(t *testing.T) {
+	eng, st, _, fl := newTestEngine(t)
+	mt := time.Now().Add(-time.Hour)
+	fl.mu["a.txt"] = e("a.txt", 10, mt)
+	if _, err := eng.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetBaselineDone(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟用户在程序退出期间删除本地文件；重启后的 Scan 不能继续执行旧 upload。
+	delete(fl.mu, "a.txt")
+	if _, err := eng.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	acts, err := st.ClaimDue(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(acts) != 1 || acts[0].Kind != state.KindDeleteCloud {
+		t.Fatalf("expected delete_cloud only, got %+v", acts)
+	}
+	stats, _ := st.Stats()
+	if stats[state.StateDone] < 1 {
+		t.Fatalf("stale upload should be superseded, stats=%v", stats)
+	}
+}
+
+func TestScanReapsCrashResidueAndCancelsMissingUpload(t *testing.T) {
+	eng, st, _, fl := newTestEngine(t)
+	mt := time.Now().Add(-time.Hour)
+	fl.mu["a.txt"] = e("a.txt", 10, mt)
+	if _, err := eng.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetBaselineDone(); err != nil {
+		t.Fatal(err)
+	}
+	acts, err := st.ClaimDue(10)
+	if err != nil || len(acts) != 1 || acts[0].Kind != state.KindUpload {
+		t.Fatalf("claim: err=%v acts=%+v", err, acts)
+	}
+
+	// 模拟进程在 upload inflight 时崩溃：本地文件随后被用户删除。
+	delete(fl.mu, "a.txt")
+	if _, err := eng.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	acts, err = st.ClaimDue(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(acts) != 1 || acts[0].Kind != state.KindDeleteCloud {
+		t.Fatalf("expected delete_cloud after reaping crash residue, got %+v", acts)
+	}
+}
+
+func TestRestoreInSyncMarksMatchingFiles(t *testing.T) {
+	eng, _, fc, fl := newTestEngine(t)
+	mt := time.Now().Add(-time.Hour)
+	fl.mu["a.txt"] = e("a.txt", 10, mt)
+	fc.mu["a.txt"] = e("a.txt", 10, mt)
+	if _, err := eng.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	drain(t, eng)
+	fl.finalizeCalls = nil
+
+	n, err := eng.RestoreInSync()
+	if err != nil || n != 1 {
+		t.Fatalf("RestoreInSync n=%d err=%v", n, err)
+	}
+	if len(fl.finalizeCalls) != 1 || fl.finalizeCalls[0] != "a.txt" {
+		t.Fatalf("finalize calls=%v", fl.finalizeCalls)
+	}
+}
+
+func TestRestoreInSyncMarksMatchingDirectories(t *testing.T) {
+	eng, _, fc, fl := newTestEngine(t)
+	mt := time.Now().Add(-time.Hour)
+	fl.mu["dir"] = CloudEntry{Path: "dir", MTime: mt, IsDir: true}
+	fc.mu["dir"] = CloudEntry{Path: "dir", MTime: mt, IsDir: true}
+	if _, err := eng.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	drain(t, eng)
+	fl.finalizeCalls = nil
+
+	n, err := eng.RestoreInSync()
+	if err != nil || n != 1 {
+		t.Fatalf("RestoreInSync n=%d err=%v", n, err)
+	}
+	if len(fl.finalizeCalls) != 1 || fl.finalizeCalls[0] != "dir" {
+		t.Fatalf("finalize calls=%v", fl.finalizeCalls)
+	}
+}
+
+func TestEnqueueMarksSyncingAndCompletionMarksSynced(t *testing.T) {
+	eng, st, fc, fl := newTestEngine(t)
+	mt := time.Now().Add(-time.Hour)
+	fl.mu["a.txt"] = e("a.txt", 10, mt)
+	fc.mu["a.txt"] = e("a.txt", 10, mt)
+	if _, err := eng.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	// 入队后未执行：应有 MarkSyncing（同步中图标），无 MarkSynced。
+	if len(fl.syncingCalls) == 0 {
+		t.Fatalf("expected MarkSyncing on enqueue, got none")
+	}
+	if len(fl.syncedCalls) != 0 {
+		t.Fatalf("synced before completion: %v", fl.syncedCalls)
+	}
+	drain(t, eng)
+	// 全部动作结算 → 该路径无 pending → MarkSynced 恢复绿勾。
+	if len(fl.syncedCalls) == 0 {
+		t.Fatalf("expected MarkSynced after completion, got none")
+	}
+	_ = st
+}
+
+func TestFailedActionKeepsSyncingIcon(t *testing.T) {
+	eng, _, fc, fl := newTestEngine(t)
+	mt := time.Now().Add(-time.Hour)
+	fl.mu["a.txt"] = e("a.txt", 10, mt)
+	fc.mu["a.txt"] = e("a.txt", 10, mt)
+	if _, err := eng.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	// 云端拉取失败 → 动作 failed → 仍有 pending → 不得恢复绿勾。
+	fc.uploadE = errors.New("network down")
+	acts, err := eng.store.ClaimDue(10)
+	if err != nil || len(acts) == 0 {
+		t.Fatalf("claim: err=%v acts=%d", err, len(acts))
+	}
+	for _, a := range acts {
+		eng.exec(a)
+	}
+	if len(fl.syncedCalls) != 0 {
+		t.Fatalf("failed action must keep syncing icon, synced=%v", fl.syncedCalls)
+	}
+}
+
+func TestRestoreInSyncSkipsPendingPaths(t *testing.T) {
+	eng, _, fc, fl := newTestEngine(t)
+	mt := time.Now().Add(-time.Hour)
+	fl.mu["a.txt"] = e("a.txt", 10, mt)
+	fc.mu["a.txt"] = e("a.txt", 10, mt)
+	if _, err := eng.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	// 不 drain：upload 仍 pending → RestoreInSync 不得给它标绿勾。
+	fl.finalizeCalls = nil
+	n, err := eng.RestoreInSync()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("RestoreInSync should skip pending path, n=%d", n)
+	}
+	if len(fl.finalizeCalls) != 0 {
+		t.Fatalf("finalize on pending path: %v", fl.finalizeCalls)
+	}
+}
+
+func TestDeleteCloudDirRevivesWhenCloudChanged(t *testing.T) {
+	eng, st, fc, fl := newTestEngine(t)
+	mt := time.Now().Add(-time.Hour)
+	// 基线：本地/云端一致的目录树
+	fl.mu["d"] = CloudEntry{Path: "d", MTime: mt, IsDir: true}
+	fl.mu["d/a.txt"] = e("d/a.txt", 10, mt)
+	fc.mu["d"] = CloudEntry{Path: "d", MTime: mt, IsDir: true}
+	fc.mu["d/a.txt"] = e("d/a.txt", 10, mt)
+	_, _ = eng.Scan()
+	_, _ = eng.Poll()
+	drain(t, eng)
+
+	// 本地删整目录 → delete_cloud 入队
+	delete(fl.mu, "d")
+	delete(fl.mu, "d/a.txt")
+	if n, err := eng.Scan(); err != nil || n == 0 {
+		t.Fatalf("scan should enqueue delete, n=%d err=%v", n, err)
+	}
+	// 他人往云端目录塞新文件（快照从未见过）
+	fc.mu["d/new.txt"] = e("d/new.txt", 5, mt.Add(time.Minute))
+
+	// 执行 delete_cloud：应整目录复活（Q18），云端一个字节都不能少。
+	// scan 遍历 map 入队顺序不定，先挑目录动作执行（断言针对目录 Purge）。
+	acts, err := st.ClaimDue(10)
+	if err != nil || len(acts) == 0 {
+		t.Fatalf("claim: %v %d", err, len(acts))
+	}
+	for _, a := range acts {
+		if a.Path == "d" {
+			eng.exec(a)
+		}
+	}
+	if _, ok := fc.mu["d/new.txt"]; !ok {
+		t.Fatal("云端目录被 Purge：从未见过的他人新文件被删（数据丢失）")
+	}
+	if _, ok := fc.mu["d/a.txt"]; !ok {
+		t.Fatal("云端目录被 Purge：已知子文件也被删")
+	}
+	// 复活 → 应转出 download 动作
+	revived := false
+	for i := 0; i < 10; i++ {
+		acts, _ := st.ClaimDue(10)
+		for _, a := range acts {
+			if a.Kind == state.KindDownload && a.Path == "d" {
+				revived = true
+			}
+			eng.exec(a)
+		}
+		if len(acts) == 0 {
+			break
+		}
+	}
+	if !revived {
+		t.Fatal("目录复活后应转出 download 动作")
 	}
 }

@@ -41,6 +41,8 @@ type CloudEntry struct {
 type Cloud interface {
 	// List 全量递归列举云端。
 	List() ([]CloudEntry, error)
+	// ListDir 递归列举某目录下全部条目（不含目录自身；目录删除前整树复查用）。
+	ListDir(rel string) ([]CloudEntry, error)
 	// Stat 单条目状态，不存在返回 (nil, nil)。
 	Stat(rel string) (*CloudEntry, error)
 	// Upload 把本地文件推到云端 rel。
@@ -70,6 +72,11 @@ type Local interface {
 	Remove(rel string) error
 	// FinalizeUpload 上传成功后收尾：普通文件转占位符 + in-sync（图标）。
 	FinalizeUpload(rel string) error
+	// MarkSyncing 把条目（含祖先目录）标为“未同步”——Explorer 显示同步中。
+	// 入队时调用；实现应容忍路径不存在（云端新建等场景）。
+	MarkSyncing(rel string)
+	// MarkSynced 把条目标回 in-sync（绿勾）。动作结算后调用。
+	MarkSynced(rel string)
 	// WasHydrated 判断该路径此前是否已水合（Q6：曾水合的自动重新下载）。
 	WasHydrated(rel string) bool
 	// Hydrate 主动把占位符数据拉到本地（Q6）：曾水合的文件在云端变更后
@@ -86,6 +93,8 @@ type Engine struct {
 	cloud Cloud
 	local Local
 	log   *log.Logger
+	// 空列表护栏连续计数（Poll 内使用，e.mu 保护）
+	emptyStreak int
 }
 
 // New 创建引擎。
@@ -107,7 +116,7 @@ func conflictName(rel string, now time.Time) string {
 // `~$` 开头 = Office 锁文件；`.tmp` 结尾 = 常见编辑器临时文件。
 // watcher 侧已过滤，引擎 Scan 侧必须同样过滤——否则 Office 打开文档的
 // 锁文件会被入队上传，随后又被用户关闭删除 → 上传失败 + 无谓的删除传播
-//（v0.3.0 用户实测：`~$21_设计标2 .docx` 上传 404 刷屏）。
+// （v0.3.0 用户实测：`~$21_设计标2 .docx` 上传 404 刷屏）。
 func isTempPath(rel string) bool {
 	base := path.Base(rel)
 	if strings.HasPrefix(base, "~$") {
@@ -182,6 +191,22 @@ func (e *Engine) scanLocked() (map[string]bool, int, error) {
 
 	dirty := map[string]bool{}
 	queued := 0
+	// Engine 的 Scan/Poll/exec 共用 e.mu，因此这里看到的 inflight 只可能是
+	// 上一次进程崩溃留下的残留；立即回收后才能按本地现状收敛旧动作。
+	if n, err := e.store.ReapInflight(0); err != nil {
+		return dirty, queued, err
+	} else if n > 0 {
+		e.log.Printf("♻ 回收 %d 个上次进程残留的 inflight 动作", n)
+	}
+	present := make(map[string]bool, len(nowMap))
+	for p := range nowMap {
+		present[p] = true
+	}
+	if n, err := e.store.CancelMissingLocal(present); err != nil {
+		return dirty, queued, err
+	} else if n > 0 {
+		e.log.Printf("♻ 收敛 %d 个本地已消失的旧动作（upload/conflict/dehydrate）", n)
+	}
 	// 1) 新增 / 修改 → upload（conflict 由 exec 前复查或 Poll 抢占裁决）
 	for _, en := range entries {
 		if isTempPath(en.Path) {
@@ -284,6 +309,10 @@ func (e *Engine) Poll() (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("cloud list: %w", err)
 	}
+	// List 成功 = 认证已恢复 → 复活 auth 失败动作（DR4 解除）
+	if rn, rerr := e.store.RetryAuthFailed(); rerr == nil && rn > 0 {
+		e.log.Printf("🔑 认证恢复，复活 %d 个 auth 失败动作", rn)
+	}
 	cloudSnap, err := e.store.AllSnap("cloud_snap")
 	if err != nil {
 		return 0, err
@@ -296,6 +325,26 @@ func (e *Engine) Poll() (int, error) {
 	if err != nil {
 		return 0, err
 	}
+
+	// 空列表护栏：基线已建立、快照有内容而 List 为空（后端故障/权限降级
+	// 常返回空而非 error）→ 首轮只记疑不下发，连续两轮空才按真实删除处理
+	//（真实清空只延迟一个周期；瞬时故障下轮恢复即自愈）。
+	if len(entries) == 0 && baseline {
+		present := 0
+		for _, cs := range cloudSnap {
+			if cs.Present {
+				present++
+			}
+		}
+		if present > 0 {
+			if e.emptyStreak == 0 {
+				e.emptyStreak = 1
+				return 0, fmt.Errorf("cloud list 为空但快照有 %d 条（疑似后端故障），本轮中止防误删，下轮复核", present)
+			}
+			e.log.Printf("⚠ cloud list 连续两轮为空（快照 %d 条）→ 按真实清空处理", present)
+		}
+	}
+	e.emptyStreak = 0
 
 	nowMap := map[string]CloudEntry{}
 	for _, en := range entries {
@@ -447,6 +496,49 @@ func (e *Engine) Poll() (int, error) {
 	return queued, nil
 }
 
+// RestoreInSync 在启动/全量对账后把“本地与云端一致且无待办”的文件重新
+// 标记 in-sync。Explorer 的绿勾是 Cloud Files 元数据，不是 Onerclone 进程
+// 内存；重启后补标可以修复此前状态丢失/目录未转占位符导致的同步箭头。
+func (e *Engine) RestoreInSync() (int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	localSnap, err := e.store.AllSnap("local_snap")
+	if err != nil {
+		return 0, err
+	}
+	cloudSnap, err := e.store.AllSnap("cloud_snap")
+	if err != nil {
+		return 0, err
+	}
+	restored := 0
+	for p, ls := range localSnap {
+		if !ls.Present {
+			continue
+		}
+		cs, ok := cloudSnap[p]
+		if !ok || !cs.Present || snapChanged(ls, cs) {
+			continue
+		}
+		pending, err := e.store.HasPendingPath(p)
+		if err != nil {
+			return restored, err
+		}
+		if pending {
+			continue
+		}
+		if err := e.local.FinalizeUpload(p); err != nil {
+			e.log.Printf("⚠ 恢复 in-sync 失败 %s: %v", p, err)
+			continue
+		}
+		restored++
+	}
+	if restored > 0 {
+		e.log.Printf("✅ 已恢复 %d 个文件的 in-sync 状态", restored)
+	}
+	return restored, nil
+}
+
 // enqueue 统一入队收口。冲突裁决规则（Q18 冲突优先）：
 //
 //  1. 互斥升级：upload pending 表示本地有未同步变化，download pending 表示
@@ -492,6 +584,9 @@ func (e *Engine) enqueue(kind state.ActionKind, p string) (int, error) {
 		return 0, err
 	}
 	if n {
+		// 入队即标“同步中”：Explorer 状态列与真实队列对齐，而不是靠
+		// MARK_IN_SYNC 的静态猜测（v0.3.6 实测：目录预标绿勾会误导状态列）。
+		e.local.MarkSyncing(p)
 		return 1, nil
 	}
 	return 0, nil
@@ -507,28 +602,35 @@ func (e *Engine) RunWorker(stop <-chan struct{}, batch int) {
 			return
 		default:
 		}
-		// 崩溃残留回收（inflight 超 2 分钟视为死任务）
+		// 崩溃残留回收（inflight 超 2 分钟视为死任务）。
+		// claim 与 exec 同锁：防止 claim 后 Poll 抢锁刷新 cloud_snap，
+		// 使 execUpload 的“云端已变”复查失效 → 静默覆盖他人改动。
+		e.mu.Lock()
 		if n, err := e.store.ReapInflight(2 * time.Minute); err == nil && n > 0 {
 			e.log.Printf("♻️ 回收 %d 个滞留 inflight 动作", n)
 		}
 		acts, err := e.store.ClaimDue(batch)
 		if err != nil {
+			e.mu.Unlock()
 			e.log.Printf("✗ 队列读取失败: %v", err)
 			sleep(stop, 5*time.Second)
 			continue
 		}
 		if len(acts) == 0 {
+			e.mu.Unlock()
 			sleep(stop, 1*time.Second)
 			continue
 		}
 		for _, a := range acts {
 			select {
 			case <-stop:
+				e.mu.Unlock()
 				return
 			default:
 			}
-			e.exec(a)
+			e.execLocked(a)
 		}
+		e.mu.Unlock()
 	}
 }
 
@@ -539,10 +641,15 @@ func sleep(stop <-chan struct{}, d time.Duration) {
 	}
 }
 
-// exec 执行单个动作并回写结果。
+// exec 执行单个动作并回写结果（自行加锁；测试直接调用）。
 func (e *Engine) exec(a state.Action) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.execLocked(a)
+}
+
+// execLocked 同 exec，但调用方必须已持 e.mu（RunWorker 批量执行用）。
+func (e *Engine) execLocked(a state.Action) {
 
 	var err error
 	class := state.ClassNetwork
@@ -576,6 +683,27 @@ func (e *Engine) exec(a state.Action) {
 	}
 	if err := e.store.Complete(a.ID); err != nil {
 		e.log.Printf("✗ 回写完成状态: %v", err)
+		return
+	}
+	// 结算后对账图标：该路径无任何未完成动作（含 failed）才恢复绿勾。
+	// 失败/重试中的条目保持“同步中”，与队列真相一致。
+	if pending, err := e.store.HasPendingPath(a.Path); err == nil && !pending {
+		e.local.MarkSynced(a.Path)
+		// 祖先目录恢复：整棵子树无待办才转绿（否则深层文件同步完，
+		// 祖先目录永远“同步中”直到重启——v0.3.6 实测的乱显示另一半根因）
+		e.restoreAncestors(a.Path)
+	}
+}
+
+// restoreAncestors 沿祖先链向上恢复绿勾：遇到第一个还有待办的目录即停
+//（其上必然也未收敛）。查询失败时保守不动。
+func (e *Engine) restoreAncestors(rel string) {
+	for p := path.Dir(rel); p != "." && p != "/" && p != ""; p = path.Dir(p) {
+		pend, err := e.store.HasPendingTree(p)
+		if err != nil || pend {
+			return
+		}
+		e.local.MarkSynced(p)
 	}
 }
 
@@ -586,15 +714,15 @@ func classify(err error) state.RetryClass {
 	}
 	s := strings.ToLower(err.Error())
 	switch {
-	case strings.Contains(s, "401"), strings.Contains(s, "403"),
+	case strings.Contains(s, "rclone rc 401"), strings.Contains(s, "rclone rc 403"),
 		strings.Contains(s, "unauthorized"), strings.Contains(s, "login"),
 		strings.Contains(s, "cookie"), strings.Contains(s, "token expired"),
 		strings.Contains(s, "please re-auth"):
 		return state.ClassAuth
-	case strings.Contains(s, "429"), strings.Contains(s, "rate limit"),
+	case strings.Contains(s, "rclone rc 429"), strings.Contains(s, "rate limit"),
 		strings.Contains(s, "too many"), strings.Contains(s, "risk"):
 		return state.ClassRateLimit
-	case strings.Contains(s, "404"), strings.Contains(s, "object not found"),
+	case strings.Contains(s, "rclone rc 404"), strings.Contains(s, "object not found"),
 		strings.Contains(s, "directory not found"), strings.Contains(s, "no such file"),
 		strings.Contains(s, "not a file"):
 		return state.ClassPermanent
@@ -616,6 +744,9 @@ func (e *Engine) execUpload(rel string) (error, state.RetryClass) {
 	if ls, ok, err := e.store.GetSnap("local_snap", rel); err == nil && ok && ls.IsDir {
 		if err := e.cloud.Mkdir(rel); err != nil {
 			return err, classify(err)
+		}
+		if err := e.local.FinalizeUpload(rel); err != nil {
+			e.log.Printf("⚠ 云端目录已建但本地收尾失败 %s: %v", rel, err)
 		}
 		if err := e.store.PutSnap("cloud_snap", ls); err != nil {
 			return err, state.ClassNetwork
@@ -671,7 +802,7 @@ func (e *Engine) execDownload(rel string) (error, state.RetryClass) {
 
 // download 落地云端条目：删旧（若有）+ 建占位符 + 对齐快照。
 // allowQ6=false 表示**脱水**：只重建占位符，不触发 Q6 主动重拉
-//（否则刚释放的空间立刻又被拉回来）。
+// （否则刚释放的空间立刻又被拉回来）。
 func (e *Engine) download(rel string, allowQ6 bool) (error, state.RetryClass) {
 	ls, lok, err := e.store.GetSnap("local_snap", rel)
 	if err != nil {
@@ -775,6 +906,23 @@ func (e *Engine) execDeleteCloud(rel string) (error, state.RetryClass) {
 		// 不在这里逐条打墓碑（Delete 语义 = 整树删除）。
 		var err error
 		if ce.IsDir {
+			// Purge 前整树复查：changed() 对目录只比存在性，看不见他人
+			// 新塞进来的文件 → 会删掉从未见过的内容。云端现内容必须与
+			// cloud_snap 已知内容完全一致，否则宁复活不删除（Q18）。
+			kids, lerr := e.cloud.ListDir(rel)
+			if lerr != nil {
+				return lerr, classify(lerr)
+			}
+			for _, k := range kids {
+				ks, _, _ := e.store.GetSnap("cloud_snap", k.Path)
+				if !ks.Present || changed(ks, k) {
+					if _, err := e.enqueue(state.KindDownload, rel); err != nil {
+						return err, state.ClassNetwork
+					}
+					e.log.Printf("♻️ 目录删除前复查：%s 内云端已变（%s）→ 整目录复活（Q18）", rel, k.Path)
+					return nil, state.ClassNetwork
+				}
+			}
 			err = e.cloud.Purge(rel)
 		} else {
 			err = e.cloud.Delete(rel)
@@ -805,16 +953,10 @@ func (e *Engine) execDeleteLocal(rel string) (error, state.RetryClass) {
 	}
 	// 复查本地实际：文件存在且相对 local_snap 变了 → 复活上传（Q18 宁复活不删除）。
 	// 文件不存在 = 入队后被用户删了 → 双删，直接落墓碑。
-	entries, err := e.local.Scan()
+	// 定点 Stat 而非全量 Scan：O(1) 且无 Scan 的改名/清理副作用。
+	actual, err := e.local.Stat(rel)
 	if err != nil {
 		return err, classify(err)
-	}
-	var actual *CloudEntry
-	for i := range entries {
-		if entries[i].Path == rel {
-			actual = &entries[i]
-			break
-		}
 	}
 	if actual != nil {
 		ls, lok, err := e.store.GetSnap("local_snap", rel)
@@ -845,12 +987,33 @@ func (e *Engine) execDeleteLocal(rel string) (error, state.RetryClass) {
 //
 // 云端已删（Stat=nil）时退化为纯上传 = Q18 复活语义。
 func (e *Engine) execConflict(rel string) (error, state.RetryClass) {
+	// 目录冲突：mkdir 幂等合并（copyfile 对目录报 "is a directory not a
+	// file" → permanent 卡死，永不收敛）。
+	if ls, ok, err := e.store.GetSnap("local_snap", rel); err == nil && ok && ls.IsDir {
+		if err := e.cloud.Mkdir(rel); err != nil {
+			return err, classify(err)
+		}
+		if err := e.local.FinalizeUpload(rel); err != nil {
+			e.log.Printf("⚠ 目录冲突 mkdir 后收尾失败 %s: %v", rel, err)
+		}
+		if err := e.store.PutSnap("cloud_snap", ls); err != nil {
+			return err, state.ClassNetwork
+		}
+		e.log.Printf("📁 目录冲突 %s：两侧合并为同一目录", rel)
+		return nil, state.ClassNetwork
+	}
 	ce, err := e.cloud.Stat(rel)
 	if err != nil {
 		return err, classify(err)
 	}
 	if ce != nil && !ce.IsDir {
-		cp := conflictName(rel, time.Now())
+		// 冲突副本名用本地快照 mtime（而非 time.Now）：重试时同名覆盖
+		// 幂等；time.Now 每次重试都生成新副本 → 重复冲突副本刷屏。
+		nameTime := time.Now()
+		if ls, ok, err := e.store.GetSnap("local_snap", rel); err == nil && ok && ls.Present {
+			nameTime = ls.MTime
+		}
+		cp := conflictName(rel, nameTime)
 		if err := e.cloud.DownloadTo(rel, cp); err != nil {
 			return err, classify(err)
 		}
@@ -870,11 +1033,6 @@ func (e *Engine) execConflict(rel string) (error, state.RetryClass) {
 	return nil, state.ClassNetwork
 }
 
-// Stats 返回队列统计（日志/UI）。
-// ---------- 面板操作（Phase 2 管理动作） ----------
-
-// RequestDehydrate 入队脱水动作；文件未水合返回 (false, nil)（无可脱）。
-// 执行时会先复查“本地是否已改”，改过则转 conflict（不丢数据）。
 func (e *Engine) RequestDehydrate(path string) (bool, error) {
 	if !e.local.WasHydrated(path) {
 		return false, nil

@@ -14,16 +14,17 @@ import (
 var (
 	dll = syscall.NewLazyDLL("CldApi.dll")
 
-	procGetPlatformInfo    = dll.NewProc("CfGetPlatformInfo")
-	procRegisterSyncRoot   = dll.NewProc("CfRegisterSyncRoot")
-	procUnregisterSyncRoot = dll.NewProc("CfUnregisterSyncRoot")
-	procGetSyncRootInfoByPath = dll.NewProc("CfGetSyncRootInfoByPath")
-	procConnectSyncRoot    = dll.NewProc("CfConnectSyncRoot")
-	procDisconnectSyncRoot = dll.NewProc("CfDisconnectSyncRoot")
-	procExecute            = dll.NewProc("CfExecute")
-	procCreatePlaceholders = dll.NewProc("CfCreatePlaceholders")
-	procSetInSyncState     = dll.NewProc("CfSetInSyncState")
-	procConvertToPlaceholder = dll.NewProc("CfConvertToPlaceholder")
+	procGetPlatformInfo          = dll.NewProc("CfGetPlatformInfo")
+	procRegisterSyncRoot         = dll.NewProc("CfRegisterSyncRoot")
+	procUnregisterSyncRoot       = dll.NewProc("CfUnregisterSyncRoot")
+	procGetSyncRootInfoByPath    = dll.NewProc("CfGetSyncRootInfoByPath")
+	procConnectSyncRoot          = dll.NewProc("CfConnectSyncRoot")
+	procDisconnectSyncRoot       = dll.NewProc("CfDisconnectSyncRoot")
+	procExecute                  = dll.NewProc("CfExecute")
+	procCreatePlaceholders       = dll.NewProc("CfCreatePlaceholders")
+	procSetInSyncState           = dll.NewProc("CfSetInSyncState")
+	procConvertToPlaceholder     = dll.NewProc("CfConvertToPlaceholder")
+	procUpdateSyncProviderStatus = dll.NewProc("CfUpdateSyncProviderStatus")
 )
 
 // HresultError 表示一次 cfapi 调用返回的失败 HRESULT。
@@ -112,26 +113,27 @@ func UnregisterSyncRoot(path string) error {
 // SyncRootStandardInfo 对应 CF_SYNC_ROOT_STANDARD_INFO（可变长：ProviderName
 // 255+1、ProviderVersion 255+1 WCHAR，尾部 SyncRootIdentity[1]）。这里只
 // 取固定前缀 + 用大缓冲整体读，字段偏移按头文件 x64 布局：
-//   FileId@0(8) Hydration@8(4) Population@12(4) InSync@16(4) HardLink@20(4)
-//   ProviderStatus@24(4) pad@28 ProviderName@32(512) ProviderVersion@544(512)
-//   IdentityLen@1056(4) Identity@1060
+//
+//	FileId@0(8) Hydration@8(4) Population@12(4) InSync@16(4) HardLink@20(4)
+//	ProviderStatus@24(4) pad@28 ProviderName@32(512) ProviderVersion@544(512)
+//	IdentityLen@1056(4) Identity@1060
 type SyncRootStandardInfo struct {
-	SyncRootFileId    int64
-	Hydration         uint16
-	HydrationModifier uint16
-	Population        uint16
+	SyncRootFileId     int64
+	Hydration          uint16
+	HydrationModifier  uint16
+	Population         uint16
 	PopulationModifier uint16
-	InSync            uint32
-	HardLink          uint32
-	ProviderStatus    uint32
-	ProviderName      string
-	ProviderVersion   string
-	SyncRootIdentity  []byte
+	InSync             uint32
+	HardLink           uint32
+	ProviderStatus     uint32
+	ProviderName       string
+	ProviderVersion    string
+	SyncRootIdentity   []byte
 }
 
 // GetSyncRootInfoByPath 查询路径所属同步根的信息（CfGetSyncRootInfoByPath，
 // InfoClass=STANDARD）。路径不在任何同步根下 → HRESULT 0x80070186
-//（ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT 语义，实测该 API 对非同步根路径
+// （ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT 语义，实测该 API 对非同步根路径
 // 返回此码）。
 func GetSyncRootInfoByPath(path string) (*SyncRootStandardInfo, error) {
 	const (
@@ -167,13 +169,13 @@ func GetSyncRootInfoByPath(path string) (*SyncRootStandardInfo, error) {
 		SyncRootFileId:     *(*int64)(unsafe.Pointer(&buf[0])),
 		Hydration:          u16v(8),
 		HydrationModifier:  u16v(10),
-		Population:          u16v(12),
+		Population:         u16v(12),
 		PopulationModifier: u16v(14),
-		InSync:              u32(16),
-		HardLink:            u32(20),
-		ProviderStatus:      u32(24),
-		ProviderName:        u16(32, maxNameW),
-		ProviderVersion:     u16(32+maxNameW*2, maxNameW),
+		InSync:             u32(16),
+		HardLink:           u32(20),
+		ProviderStatus:     u32(24),
+		ProviderName:       u16(32, maxNameW),
+		ProviderVersion:    u16(32+maxNameW*2, maxNameW),
 	}
 	idLen := int(u32(32 + maxNameW*4))
 	if idLen > 0 && 1060+idLen <= len(buf) {
@@ -270,6 +272,16 @@ func Connect(path string, flags uint32, handlers map[CallbackType]CallbackFunc) 
 	return s, nil
 }
 
+// ActiveSession 返回当前连接会话（无连接返回 nil）。
+// 回调期间用它而非缓存的 Session 指针：Connect 调用中回调就可能触发，
+// 那时调用方还没拿到返回值——用缓存指针会 nil 解引用，被 recover 吞掉后
+// CF 认为传输成功 → 用户 I/O 挂 60s。
+func ActiveSession() *Session {
+	sessionMu.RLock()
+	defer sessionMu.RUnlock()
+	return active
+}
+
 // Disconnect 断开同步根连接（不注销注册表）。
 func (s *Session) Disconnect() error {
 	sessionMu.Lock()
@@ -349,15 +361,18 @@ func CreatePlaceholders(baseDir string, items []NewPlaceholder) ([]int32, error)
 	p := utf16ptr(baseDir)
 	infos := make([]PlaceholderCreateInfo, len(items))
 	names := make([][]uint16, len(items)) // KeepAlive：持有 UTF-16 缓冲
+	identities := make([][]byte, len(items))
 	for i, it := range items {
 		u, err := syscall.UTF16FromString(it.RelativeFileName)
 		if err != nil {
 			return nil, fmt.Errorf("cfapi: bad name %q: %w", it.RelativeFileName, err)
 		}
 		names[i] = u
-		flags := it.Flags
-		if flags == 0 {
-			flags = PlaceholderCreateFlagMarkInSync
+		identities[i] = it.Identity
+		flags := placeholderCreateFlags(it.IsDir, it.Flags)
+		attrs := uint32(FileAttributeNormal)
+		if it.IsDir {
+			attrs = FileAttributeDirectory
 		}
 		infos[i] = PlaceholderCreateInfo{
 			RelativeFileName: &names[i][0],
@@ -367,7 +382,7 @@ func CreatePlaceholders(baseDir string, items []NewPlaceholder) ([]int32, error)
 					LastAccessTime: toFiletime(it.ModTime),
 					LastWriteTime:  toFiletime(it.ModTime),
 					ChangeTime:     toFiletime(it.ModTime),
-					FileAttributes: FileAttributeNormal,
+					FileAttributes: attrs,
 				},
 				FileSize: it.FileSize,
 			},
@@ -387,6 +402,7 @@ func CreatePlaceholders(baseDir string, items []NewPlaceholder) ([]int32, error)
 	)
 	runtime.KeepAlive(infos)
 	runtime.KeepAlive(names)
+	runtime.KeepAlive(identities)
 	runtime.KeepAlive(p)
 	results := make([]int32, len(infos))
 	for i := range infos {
@@ -402,27 +418,53 @@ func CreatePlaceholders(baseDir string, items []NewPlaceholder) ([]int32, error)
 // ---------- in-sync 标记 ----------
 
 const (
-	fileAccessAttributes = 0x00000080 | 0x00000100 // FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES
-	fileShareAll         = 0x00000001 | 0x00000002 | 0x00000004
-	openExisting         = 3
+	fileAccessAttributes    = 0x00000080 | 0x00000100 // FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES
+	fileShareAll            = 0x00000001 | 0x00000002 | 0x00000004
+	openExisting            = 3
+	fileFlagBackupSemantics = 0x02000000 // 打开目录句柄必需
 )
 
-// SetInSync 以属性级访问打开文件并标记 in-sync（云朵图标条件之一）。
+// SetInSync 以属性级访问打开文件并标记 in-sync（绿勾图标条件之一）。
 // 属性级打开不读取数据，不会触发水合。
 func SetInSync(path string) error {
+	return setInSyncState(path, InSyncStateInSync)
+}
+
+// SetNotInSync 把条目标记为“未同步”（Explorer 显示同步中图标）。入队
+// upload/download 等待执行时调用；绿勾只在动作结算后由 SetInSync 恢复。
+// 目录同样适用（Explorer 的文件夹状态不聚合子文件，必须显式标记）。
+func SetNotInSync(path string) error {
+	return setInSyncState(path, InSyncStateNotInSync)
+}
+
+func setInSyncState(path string, syncState uint32) error {
 	p := utf16ptr(path)
-	h, err := syscall.CreateFile(p, fileAccessAttributes, fileShareAll, nil, openExisting, 0, 0)
+	h, err := syscall.CreateFile(p, fileAccessAttributes, fileShareAll, nil, openExisting, fileFlagBackupSemantics, 0)
 	if err != nil {
 		return fmt.Errorf("cfapi: open for in-sync: %w", err)
 	}
 	defer syscall.CloseHandle(h)
 	r1, _, _ := procSetInSyncState.Call(
 		uintptr(h),
-		uintptr(InSyncStateInSync),
+		uintptr(syncState),
 		uintptr(SetInSyncFlagNone),
 		0, // InSyncUsn = NULL：不校验 USN
 	)
 	runtime.KeepAlive(p)
+	return hr(r1)
+}
+
+// ProviderStatus 对应 CF_SYNC_PROVIDER_STATUS。Explorer 会把 DISCONNECTED
+// 显示为“同步中/不可用”一类状态，因此程序运行期间必须显式上报 IDLE。
+const (
+	ProviderStatusDisconnected uint32 = 0
+	ProviderStatusIdle         uint32 = 1
+)
+
+// UpdateProviderStatus 上报 provider 连接状态。Session 连接后调用一次
+// ProviderStatusIdle；退出前上报 Disconnected。
+func (s *Session) UpdateProviderStatus(status uint32) error {
+	r1, _, _ := procUpdateSyncProviderStatus.Call(uintptr(s.key), uintptr(status))
 	return hr(r1)
 }
 
@@ -449,7 +491,7 @@ func ConvertToPlaceholder(path string, flags uint32) error {
 	// 转换需要通用写权限（与 CreateFile 的属性级访问不同）
 	h, err := syscall.CreateFile(p,
 		syscall.GENERIC_READ|syscall.GENERIC_WRITE,
-		fileShareAll, nil, openExisting, 0, 0)
+		fileShareAll, nil, openExisting, fileFlagBackupSemantics, 0)
 	if err != nil {
 		if readonly {
 			_ = syscall.SetFileAttributes(p, origAttr) // 打开失败也要把只读还回去
@@ -474,8 +516,8 @@ func ConvertToPlaceholder(path string, flags uint32) error {
 
 // PlatformVersion 返回系统 Cloud Files 平台版本。
 type PlatformVersion struct {
-	BuildNumber      uint32
-	RevisionNumber   uint32
+	BuildNumber       uint32
+	RevisionNumber    uint32
 	IntegrationNumber uint32
 }
 

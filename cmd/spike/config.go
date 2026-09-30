@@ -9,7 +9,6 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -139,41 +138,6 @@ func configWritePath() string {
 		}
 	}
 	return ""
-}
-
-// saveConfig 把配置写回 onerclone.json（面板设置区用）。只覆盖给出的
-// 字段：零值字段保留磁盘上已有配置的值，避免把用户没动的字段抹掉。
-func saveConfig(patch config) (string, error) {
-	p := configWritePath()
-	if p == "" {
-		return "", fmt.Errorf("找不到可写的配置目录")
-	}
-	cur := defaultConfig()
-	if b, err := os.ReadFile(p); err == nil {
-		b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
-		_ = json.Unmarshal(b, &cur) // 解析失败则从默认开始
-	}
-	if patch.SyncRoot != "" {
-		cur.SyncRoot = patch.SyncRoot
-	}
-	if patch.Remote != "" {
-		cur.Remote = patch.Remote
-	}
-	if patch.Fs != "" {
-		cur.Fs = patch.Fs
-	}
-	if patch.Rclone != "" {
-		cur.Rclone = patch.Rclone
-	}
-	cur.Offline = patch.Offline || cur.Offline
-	data, err := json.MarshalIndent(cur, "", "  ")
-	if err != nil {
-		return "", err
-	}
-	if err := os.WriteFile(p, append(data, '\n'), 0o644); err != nil {
-		return "", err
-	}
-	return p, nil
 }
 
 // resolveRclone 找 rclone 可执行文件：flag → 配置 → exe 同目录 → PATH → 兜底。

@@ -49,10 +49,10 @@ const (
 type RetryClass string
 
 const (
-	ClassNetwork   RetryClass = "network"   // 网络类：指数退避无限重试（封顶 5min+抖动）
+	ClassNetwork   RetryClass = "network"    // 网络类：指数退避无限重试（封顶 5min+抖动）
 	ClassRateLimit RetryClass = "rate_limit" // 429/风控：大幅降速
-	ClassAuth      RetryClass = "auth"      // cookie 过期：停队列 + 扫码提醒（不自动重试）
-	ClassPermanent RetryClass = "permanent" // 永久错误（如远端 404）：进 failed
+	ClassAuth      RetryClass = "auth"       // cookie 过期：停队列 + 扫码提醒（不自动重试）
+	ClassPermanent RetryClass = "permanent"  // 永久错误（如远端 404）：进 failed
 )
 
 // Action 是队列中的一条动作。
@@ -271,8 +271,10 @@ func (s *Store) ResetLocalSnap() error {
 
 // ---------- 队列 ----------
 
-// Enqueue 入队（幂等：同 path+kind 合并重置为 pending；仅 inflight 不动——
-// 执行中不打断，done/failed 允许重置为新一轮 pending）。
+// Enqueue 入队（幂等：同 path+kind 合并重置为 pending；仅 inflight/failed 不动
+// ——执行中不打断；failed 不复活：auth 类等认证恢复后由 RetryAuthFailed 统一复活
+// （否则每轮 Poll 幂等重入队把 DR4“认证失败停队列”打破成无限重试循环），
+// permanent 类等路径变更（删后重建）自然换新动作）。
 // 返回是否真正新入队/重置（用于日志去重）。
 func (s *Store) Enqueue(path string, kind ActionKind, class RetryClass) (bool, error) {
 	now := time.Now()
@@ -281,7 +283,7 @@ func (s *Store) Enqueue(path string, kind ActionKind, class RetryClass) (bool, e
 		 VALUES(?,?, 'pending', ?, 0, 0, '', ?, ?)
 		 ON CONFLICT(path,kind) DO UPDATE SET
 		   state='pending', class=excluded.class, next_try=0, updated=excluded.updated
-		   WHERE queue.state <> 'inflight'`,
+		   WHERE queue.state NOT IN ('inflight','failed')`,
 		path, kind, string(class), now.UnixNano(), now.UnixNano())
 	if err != nil {
 		return false, err
@@ -525,6 +527,99 @@ func (s *Store) HasPending(path string, kind ActionKind) (bool, error) {
 		`SELECT COUNT(*) FROM queue WHERE path=? AND kind=? AND state='pending'`,
 		path, string(kind)).Scan(&n)
 	return n > 0, err
+}
+
+// HasPendingPath 判断该路径是否还有未完成动作（含 failed/inflight）。
+func (s *Store) HasPendingPath(path string) (bool, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM queue WHERE path=? AND state<>'done'`, path).Scan(&n)
+	return n > 0, err
+}
+
+// RetryAuthFailed 把 auth 类 failed 动作复活为 pending（认证恢复后调用，
+// 通常由 Poll 在 List 成功后触发——List 能成功即认证有效）。
+func (s *Store) RetryAuthFailed() (int64, error) {
+	res, err := s.db.Exec(
+		`UPDATE queue SET state='pending', next_try=0, updated=? WHERE state='failed' AND class='auth'`,
+		time.Now().UnixNano())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// GCDone 清理已完成动作（保留最近 keep 内的，防 done 行无限膨胀：
+// 10 万文件 = 10 万行永久滞留）。
+func (s *Store) GCDone(keep time.Duration) (int64, error) {
+	cutoff := time.Now().Add(-keep).UnixNano()
+	res, err := s.db.Exec(`DELETE FROM queue WHERE state='done' AND updated < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// HasPendingTree 判断 prefix 目录（含自身路径）下是否还有未完成动作
+// （含 failed/inflight；祖先目录图标恢复用）。
+func (s *Store) HasPendingTree(prefix string) (bool, error) {
+	esc := strings.ReplaceAll(prefix, `\`, `\\`)
+	esc = strings.ReplaceAll(esc, `%`, `\%`)
+	esc = strings.ReplaceAll(esc, `_`, `\_`)
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM queue
+		 WHERE state IN ('pending','inflight','failed')
+		   AND (path = ? OR path LIKE ? ESCAPE '\')`,
+		prefix, esc+"/%").Scan(&n)
+	return n > 0, err
+}
+
+// CancelMissingLocal 收敛本地已消失的旧动作：upload/conflict/dehydrate
+// 依赖本地文件存在，本地没了就不能继续执行，否则会拿旧路径打 rclone 404。
+// delete_cloud 是“本地删除 -> 删云端”的正当动作，必须保留。
+func (s *Store) CancelMissingLocal(present map[string]bool) (int64, error) {
+	rows, err := s.db.Query(
+		`SELECT id,path,kind FROM queue WHERE state IN ('pending','failed')`)
+	if err != nil {
+		return 0, err
+	}
+	type stale struct {
+		id   int64
+		path string
+		kind ActionKind
+	}
+	var staleActions []stale
+	for rows.Next() {
+		var a stale
+		var kind string
+		if err := rows.Scan(&a.id, &a.path, &kind); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		a.kind = ActionKind(kind)
+		if !present[a.path] {
+			switch a.kind {
+			case KindUpload, KindConflict, KindDehydrate:
+				staleActions = append(staleActions, a)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+
+	now := time.Now().UnixNano()
+	for _, a := range staleActions {
+		if _, err := s.db.Exec(
+			`UPDATE queue SET state='done', last_err='superseded: local missing',
+			 updated=? WHERE id=? AND state IN ('pending','failed')`, now, a.id); err != nil {
+			return 0, err
+		}
+	}
+	return int64(len(staleActions)), nil
 }
 
 // PendingCount 返回到点待执行数。

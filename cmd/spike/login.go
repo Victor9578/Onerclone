@@ -17,7 +17,6 @@ package main
 //   → 全程套用 quark.go 的「原始 rclone.conf 快照 + 恢复」套路。
 //
 // CLI：`onerclone login`（交互式逐题作答）
-// 面板：`/api/providers`、`/api/login/start`、`/api/login/answer`（见 panel.go）
 
 import (
 	"encoding/json"
@@ -181,7 +180,7 @@ func cmdLogin(args []string) {
 		fmt.Printf("❌ 验证失败（凭据可能未生效）: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("✅ 登录完成：%s:（在面板设置区选择它，或改 onerclone.json 的 remote 字段）\n", *name)
+	fmt.Printf("✅ 登录完成：%s:（改 onerclone.json 的 remote 字段即可启用）\n", *name)
 }
 
 // loginStepCLI 处理状态机的一题（CLI 交互版）。

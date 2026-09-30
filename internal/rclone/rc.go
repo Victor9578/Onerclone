@@ -69,9 +69,14 @@ func readError(resp *http.Response) error {
 	return fmt.Errorf("rclone rc %s: %s", resp.Status, bytes.TrimSpace(b))
 }
 
-// postJSON 发送 JSON 请求并解析响应。
+// postJSON 发送 JSON 请求并解析响应（短请求，60s 超时）。
 func (c *Client) postJSON(path string, params any, out any) error {
-	resp, err := c.do(c.jsonHTTP, path, params)
+	return c.postJSONOn(c.jsonHTTP, path, params, out)
+}
+
+// postJSONOn 同 postJSON，但可指定 HTTP 客户端（长操作用无超时的 rawHTTP）。
+func (c *Client) postJSONOn(h *http.Client, path string, params any, out any) error {
+	resp, err := c.do(h, path, params)
 	if err != nil {
 		return fmt.Errorf("rclone rc %s: %w", path, err)
 	}
@@ -109,29 +114,6 @@ func (c *Client) List(fs, remote string) ([]Entry, error) {
 		return nil, err
 	}
 	return out.List, nil
-}
-
-// Cat 读取 [offset, end) 区间的内容。
-func (c *Client) Cat(fs, remote string, offset, end int64) ([]byte, error) {
-	params := map[string]any{
-		"fs":     fs,
-		"remote": remote,
-		"offset": offset,
-		"end":    end,
-	}
-	resp, err := c.do(c.rawHTTP, "/operations/cat", params)
-	if err != nil {
-		return nil, fmt.Errorf("rclone cat: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, readError(resp)
-	}
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("rclone cat read: %w", err)
-	}
-	return b, nil
 }
 
 // RangeGet 通过 --rc-serve 的 HTTP GET 读取 [start, end) 区间内容。
@@ -179,8 +161,9 @@ func (c *Client) RangeGet(fsPath, remote string, start, end int64) ([]byte, erro
 }
 
 // CopyFile 把单个文件从 src 复制到 dst（服务端操作；local→local 即文件复制）。
+// 大文件服务端复制可能远超 60s，走无超时客户端。
 func (c *Client) CopyFile(srcFs, srcRemote, dstFs, dstRemote string) error {
-	return c.postJSON("/operations/copyfile", map[string]any{
+	return c.postJSONOn(c.rawHTTP, "/operations/copyfile", map[string]any{
 		"srcFs":    srcFs,
 		"srcRemote": srcRemote,
 		"dstFs":    dstFs,
@@ -244,10 +227,12 @@ func (c *Client) Stat(fs, remote string) (*Entry, error) {
 		"remote": remote,
 	}, &out)
 	if err != nil {
-		// rclone 对不存在的路径返回 404/doesn't exist 错误体
+		// rclone 对不存在的路径返回 404/doesn't exist 错误体。
+		// 只锚定明确消息：裸匹配 "404" 会把无关错误（如错误端点）
+		// 误判成"不存在" → 墓碑+复活回环。
 		if strings.Contains(err.Error(), "directory not found") ||
 			strings.Contains(err.Error(), "object not found") ||
-			strings.Contains(err.Error(), "404") {
+			strings.Contains(err.Error(), "doesn't exist") {
 			return nil, nil
 		}
 		return nil, err

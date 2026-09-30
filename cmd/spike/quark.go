@@ -80,9 +80,11 @@ func cmdQuarkLogin(args []string) {
 		fmt.Printf("remote [%s] 不存在 → config create\n", *name)
 	} else {
 		// quark 非 OAuth backend，`config reconnect` 不支持（实测
-		// "backend doesn't support reconnect"）；重扫码 = 删重建
-		fmt.Printf("remote [%s] 已存在 → 删除后重建（重新扫码）\n", *name)
-		_ = runRclone(*rcloneExe, "config", "delete", *name)
+		// "backend doesn't support reconnect"）；重扫码 = create 重建。
+		// 不先 config delete：create 本身会重建整段（快照+恢复套路就是
+		// 为此设计），先删只会把旧 cookie 在快照之前就丢掉——扫码失败时
+		// "登录态不丢"失效。
+		fmt.Printf("remote [%s] 已存在 → create 重建（重新扫码）\n", *name)
 	}
 
 	if *interactive {
@@ -310,8 +312,16 @@ func quarkRestoreSectionRaw(path, name string, saved map[string]string) {
 	// 插在段头之后
 	lines = append(append(append([]string{}, lines[:secStart+1]...), insert...), lines[secStart+1:]...)
 	out := strings.Join(lines, "\n")
-	if err := os.WriteFile(path, []byte(out), 0o666); err != nil {
+	// 原子写：临时文件 + rename（崩溃/断电落在写一半会损坏整个 conf，
+	// 所有 remote 一起丢）。
+	tmp := path + ".onerclone-tmp"
+	if err := os.WriteFile(tmp, []byte(out), 0o666); err != nil {
 		log.Printf("⚠ 写回配置失败: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		log.Printf("⚠ 原子替换配置失败: %v", err)
+		_ = os.Remove(tmp)
 		return
 	}
 	log.Printf("🔁 已保留原 remote 参数（%s）—— 扫码成功后新 cookie 会覆盖，失败则登录态不丢",
@@ -353,16 +363,6 @@ func rcloneOutput(exe string, sub ...string) (string, error) {
 	c := exec.Command(exe, sub...)
 	out, err := c.Output()
 	return string(out), err
-}
-
-// runRcloneQuiet 静默执行并合并捕获 stdout/stderr（面板扫码用：
-// 不往控制台刷 rclone 的用法提示，失败时由调用方展示）。
-func runRcloneQuiet(exe string, sub ...string) (string, error) {
-	c := exec.Command(exe, sub...)
-	var buf bytes.Buffer
-	c.Stdout, c.Stderr = &buf, &buf
-	err := c.Run()
-	return buf.String(), err
 }
 
 // quarkRemoteFlag 返回 run 命令使用的云端 fs。
