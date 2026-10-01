@@ -47,7 +47,7 @@ Write-Host ("  onerclone.exe  {0:N1} MB" -f ($exe.Length / 1MB))
 
 Write-Host '== 3/4 组装发布目录 ==' -ForegroundColor Cyan
 # 夸克专用 rclone fork（成品必需；放在 exe 同目录可被自动发现）
-$rcloneCandidates = @('D:\Tools\rclone\rclone.exe', 'D:\Software\rclone\rclone.exe', 'D:\Tools\onerclone\rclone.exe')
+$rcloneCandidates = @((Join-Path $root 'rclone.exe'), 'D:\Tools\rclone\rclone.exe', 'D:\Software\rclone\rclone.exe', 'D:\Tools\onerclone\rclone.exe')
 $rcloneSrc = $rcloneCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if ($rcloneSrc) {
     Copy-Item $rcloneSrc (Join-Path $stage 'rclone.exe')
