@@ -26,3 +26,4 @@ srm.reg
 captured_*.reg
 watchlog.txt
 child_probe.*
+rclone.exe
