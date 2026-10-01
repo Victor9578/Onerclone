@@ -12,8 +12,10 @@ brace_depth.txt
 *.state/
 
 # 诊断临时程序
-tmp_line/
-tmp_stat/
+tmp_*/
+
+# agent skills 基础设施残留
+skills-lock.json
 
 # 本地替身测试数据（ensureSample 会自动重新生成）
 /spike-remote/

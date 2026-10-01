@@ -48,10 +48,12 @@ const (
 
 const (
 	providerName    = "Onerclone"
-	providerVersion = "0.0.1-spike"
 	syncRootID      = "onerclone-spike-root-1"
 	fileIdentityID  = "onerclone-spike-file-1"
 )
+
+// providerVersion 用 ldflags 注入的版本号（dev 构建为 "vdev"）。
+func providerVersion() string { return "v" + version }
 
 type app struct {
 	syncRoot string // 本地同步根（NTFS）
@@ -253,7 +255,7 @@ func cmdRegister(args []string) {
 	elev := isElevated()
 	log.Printf("当前进程 elevated = %v", elev)
 
-	reg := cfapi.NewRegistration(providerName, providerVersion, []byte(syncRootID), []byte(fileIdentityID))
+	reg := cfapi.NewRegistration(providerName, providerVersion(), []byte(syncRootID), []byte(fileIdentityID))
 	pol := cfapi.NewPolicies()
 
 	err := cfapi.RegisterSyncRoot(*root, reg, pol, cfapi.RegisterFlagNone)
@@ -428,7 +430,7 @@ func cmdRun(args []string) {
 		log.Printf("⚠ 同步根迁移检查失败（继续尝试注册当前根）: %v", err)
 	}
 	if err := cfapi.RegisterSyncRoot(a.syncRoot,
-		cfapi.NewRegistration(providerName, providerVersion, []byte(syncRootID), []byte(fileIdentityID)),
+		cfapi.NewRegistration(providerName, providerVersion(), []byte(syncRootID), []byte(fileIdentityID)),
 		cfapi.NewPolicies(), cfapi.RegisterFlagUpdate); err != nil {
 		log.Printf("⚠ 同步根策略更新失败（继续用现有注册）: %v", err)
 	} else {
