@@ -25,7 +25,8 @@
 # 1) 扫码登录夸克（只需一次；cookie 过期后重跑）
 .\onerclone.exe quark-login
 
-# 2) 开始同步（无参数 = 读同目录 onerclone.json，首次运行自动生成模板）
+# 2) 开始同步（无参数 = 打开 GUI 窗口，同步引擎随窗口启动）
+#    在终端里跑 `onerclone run` 可用 CLI 形态（输出接回当前终端）
 .\onerclone.exe
 ```
 
@@ -52,7 +53,7 @@
 
 ## 管理方式
 
-Onerclone 不再启动本地 Web 面板。日常状态看 Explorer 的云朵/绿勾图标；异常和队列详情看 `onerclone.log`；登录用 `onerclone quark-login` 或 `onerclone login`；配置直接编辑 `onerclone.json` 后重启。
+Onerclone 不再启动本地 Web 面板。日常状态看 Explorer 的云朵/绿勾图标；传输队列/失败重试看 GUI 窗口（无参数启动）或 `onerclone.log`；登录用 `onerclone quark-login` 或 `onerclone login`；配置直接编辑 `onerclone.json` 后重启。
 
 ## 配置（exe 同目录 `onerclone.json`）
 
@@ -110,8 +111,8 @@ onerclone help               帮助
 ## 从源码构建
 
 ```powershell
-.\build.ps1 -Version 0.2.0                 # 测试 + 构建 + 打包 → dist\*.zip
-.\build.ps1 -Version 0.2.0 -Installer      # 额外编译安装包（需 Inno Setup 6）
+.\build.ps1 -Version 0.4.0                 # 测试 + 构建 + 打包 → dist\*.zip
+.\build.ps1 -Version 0.4.0 -Installer      # 额外编译安装包（需 Inno Setup 6）
 ```
 
 产物：

@@ -10,7 +10,7 @@
 ;   - 卸载：先关自启，再 `onerclone unregister` 注销同步根（读 {app} 配置）
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.3.6"
+  #define MyAppVersion "0.4.0"
 #endif
 #define MyAppName "Onerclone"
 #define MyAppExeName "onerclone.exe"
@@ -28,7 +28,7 @@ OutputDir=dist
 OutputBaseFilename=onerclone-setup-{#MyAppVersion}
 Compression=lzma2/max
 SolidCompression=yes
-SetupIconFile=cmd\spike\ui\tray.ico
+SetupIconFile=internal\app\ui\tray.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName}
 WizardStyle=modern

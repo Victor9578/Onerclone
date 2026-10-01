@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Onerclone</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="hdr">
+  <div id="state">
+    <span id="dot" class="dot starting"></span>
+    <span id="stateText">正在启动…</span>
+  </div>
+  <div id="target" class="muted"></div>
+</header>
+
+<section id="summary">
+  <div class="stat"><b id="nPending">0</b><span>等待中</span></div>
+  <div class="stat"><b id="nInflight">0</b><span>进行中</span></div>
+  <div class="stat"><b id="nFailed">0</b><span>失败</span></div>
+  <div class="stat"><b id="nDone">0</b><span>已完成</span></div>
+</section>
+
+<div id="authBanner" class="banner hidden">
+  🛑 有动作因登录过期停摆，请重新登录后点「重试」。
+</div>
+<div id="errBanner" class="banner err hidden"></div>
+
+<main id="list"></main>
+
+<footer>
+  <button id="btnRoot">打开同步根</button>
+  <button id="btnLog">打开日志</button>
+  <button id="btnRetry">重试失败项</button>
+  <button id="btnQuit" class="danger">退出</button>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

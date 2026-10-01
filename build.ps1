@@ -12,7 +12,7 @@
 #   dist\onerclone-setup-<版本>.exe       安装包（需 -Installer + Inno Setup 6）
 
 param(
-    [string]$Version = "0.3.6",
+    [string]$Version = "0.4.0",
     [switch]$SkipTests,
     [switch]$Installer
 )
@@ -30,13 +30,15 @@ if (-not $SkipTests) {
     if ($LASTEXITCODE -ne 0) { throw '测试失败，中止打包' }
 }
 
-Write-Host '== 2/4 构建 onerclone.exe ==' -ForegroundColor Cyan
+Write-Host '== 2/4 构建 onerclone.exe（GUI+CLI 单 exe） ==' -ForegroundColor Cyan
 $stage = Join-Path $root "dist\onerclone-v$Version-win64"
 Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
 $exePath = Join-Path $stage 'onerclone.exe'
-go build -trimpath -ldflags $ldflags -o $exePath ./cmd/spike
+# -H windowsgui：无参数启动 = GUI（无控制台闪窗）；子命令 = CLI
+# （启动时 AttachConsole 接回父终端，见 cmd/onerclone/console_windows.go）
+go build -trimpath -ldflags "$ldflags -H windowsgui" -o $exePath ./cmd/onerclone
 if ($LASTEXITCODE -ne 0) { throw '构建失败' }
 $exe = Get-Item $exePath
 Write-Host ("  onerclone.exe  {0:N1} MB" -f ($exe.Length / 1MB))
