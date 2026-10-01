@@ -36,9 +36,11 @@ Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
 $exePath = Join-Path $stage 'onerclone.exe'
+# -tags desktop,production：Wails 要求（缺了运行时弹“will not build without
+# the correct build tags”提示框）
 # -H windowsgui：无参数启动 = GUI（无控制台闪窗）；子命令 = CLI
 # （启动时 AttachConsole 接回父终端，见 cmd/onerclone/console_windows.go）
-go build -trimpath -ldflags "$ldflags -H windowsgui" -o $exePath ./cmd/onerclone
+go build -trimpath -tags desktop,production -ldflags "$ldflags -H windowsgui" -o $exePath ./cmd/onerclone
 if ($LASTEXITCODE -ne 0) { throw '构建失败' }
 $exe = Get-Item $exePath
 Write-Host ("  onerclone.exe  {0:N1} MB" -f ($exe.Length / 1MB))
