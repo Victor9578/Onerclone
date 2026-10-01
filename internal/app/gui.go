@@ -21,6 +21,11 @@ func LoadConfigForGUI() ConfigDTO {
 // DefaultRootForGUI 返回默认同步根（未启动时的占位显示）。
 func DefaultRootForGUI() string { return defaultRoot() }
 
+// ResolveRcloneForGUI 是 rclone 自动发现（flag > 配置 > exe 同目录 > PATH）
+// 的 GUI 包装。CLI 在 cmdRun 里调，GUI 必须同样调，否则空路径 →
+// StartRcd 报 exec: no command。
+func ResolveRcloneForGUI(cfgVal string) string { return resolveRclone("", cfgVal) }
+
 // SyncRoot 返回当前同步根。
 func (a *app) SyncRoot() string { return a.syncRoot }
 

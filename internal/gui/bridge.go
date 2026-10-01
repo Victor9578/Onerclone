@@ -58,7 +58,7 @@ func (b *Bridge) startup(ctx StartupContext) {
 			Root:      cfg.SyncRoot,
 			Fs:        cfg.Fs,
 			Remote:    cfg.Remote,
-			RcloneExe: cfg.Rclone,
+			RcloneExe: app.ResolveRcloneForGUI(cfg.Rclone),
 			Offline:   cfg.Offline,
 		})
 		b.mu.Lock()
